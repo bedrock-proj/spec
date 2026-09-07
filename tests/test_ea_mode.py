@@ -1,29 +1,48 @@
+"""An EA family publishes exactly its declared local member inventory."""
+
+import tempfile
 import unittest
 from pathlib import Path
 
-from engine.ea_mode import EAMode, EAModeCatalog
-from engine.type_system import TypeSystem
+from engine.isa.ea import load_ea_catalog
 
 
-class EAModeTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.isa_root = Path(__file__).parents[1] / "isa"
+class EAModeInventoryTest(unittest.TestCase):
+    def test_declared_member_order_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("first", "second"):
+                (root / name).mkdir()
+            source = root / "modes.yaml"
+            source.write_text("name: Modes\nmodes: [second, first]\n")
+            catalog = load_ea_catalog(source, owner="base", profile="Ea", mode_type="compact")
+            self.assertEqual(catalog.modes, ("second", "first"))
 
-    def test_all_concrete_modes_validate(self) -> None:
-        types = TypeSystem.load(self.isa_root)
-        for catalog in EAModeCatalog.discover(self.isa_root, types):
-            actual = {
-                path.name
-                for path in catalog.source.parent.iterdir()
-                if path.is_dir() and not path.name.startswith(".")
-            }
-            self.assertEqual(set(catalog.modes), actual)
-            for mode_id in catalog.modes:
-                path = catalog.mode_path(mode_id)
-                with self.subTest(path=path):
-                    mode = EAMode.load(path, self.isa_root, types)
-                    self.assertEqual(mode.catalog, catalog)
+    def test_missing_declared_member_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "modes.yaml"
+            source.write_text("name: Modes\nmodes: [absent]\n")
+            with self.assertRaises(ValueError):
+                load_ea_catalog(source, owner="base", profile="Ea", mode_type="compact")
+
+    def test_undeclared_member_directory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "unlisted").mkdir()
+            source = root / "modes.yaml"
+            source.write_text("name: Modes\nmodes: []\n")
+            with self.assertRaises(ValueError):
+                load_ea_catalog(source, owner="base", profile="Ea", mode_type="compact")
+
+    def test_duplicate_declared_member_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "repeated").mkdir()
+            source = root / "modes.yaml"
+            source.write_text("name: Modes\nmodes: [repeated, repeated]\n")
+            with self.assertRaises(ValueError):
+                load_ea_catalog(source, owner="base", profile="Ea", mode_type="compact")
+
 
 if __name__ == "__main__":
     unittest.main()

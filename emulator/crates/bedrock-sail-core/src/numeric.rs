@@ -126,13 +126,15 @@ pub fn execute(
     operation: i32,
     request: &SailCoreNumericRequest,
 ) -> Result<SailCoreNumericResponse, UnsupportedNumericOperation> {
+    let round = rounding(request.rounding_mode);
+    let (prepared, conversion_causes) = prepare_operation_request(operation, request, round);
+    let request = &prepared;
     let mut response = SailCoreNumericResponse {
         valid: true,
         flags_mask: request.flags_mask as u8,
         ..SailCoreNumericResponse::default()
     };
     let operands = &request.operands;
-    let round = rounding(request.rounding_mode);
     if let Some(base_conversion) = vector_conversion(operation) {
         let conversion = VectorConversion {
             source_fp: matches!(operands[0].kind, VALUE_BITS16 | VALUE_BITS32 | VALUE_BITS64),
@@ -157,6 +159,7 @@ pub fn execute(
             }
             response.primary = value;
         }
+    } else if exact_after_format_conversion(operation, request, &mut response) {
     } else if operation == operation::OP_FADD {
         binary(request, &mut response, Binary::Add, round);
     } else if operation == operation::OP_FSUB {
@@ -228,7 +231,87 @@ pub fn execute(
     } else {
         return Err(UnsupportedNumericOperation(operation));
     }
+    response.generated_causes |= conversion_causes;
     Ok(response)
+}
+
+fn prepare_operation_request(
+    operation: i32,
+    request: &SailCoreNumericRequest,
+    round: Round,
+) -> (SailCoreNumericRequest, u8) {
+    let mut prepared = *request;
+    if scalar_conversion(operation).is_some() || vector_conversion(operation).is_some() {
+        return (prepared, 0);
+    }
+    let destination_width = request.element_width as usize;
+    let mut causes = 0;
+    for operand in prepared
+        .operands
+        .iter_mut()
+        .take(request.operand_count as usize)
+    {
+        if !operand.valid || !is_fp_kind(operand.kind) {
+            continue;
+        }
+        let source_width = operand_width(operand.kind, request.element_width) as usize;
+        if source_width == destination_width {
+            continue;
+        }
+        let (bits, operand_causes) = if is_nan(operand.bits, source_width as i64) {
+            (
+                convert_nan(
+                    operand.bits,
+                    source_width as i64,
+                    destination_width as i64,
+                ),
+                if is_signaling_nan(operand.bits, source_width as i64) {
+                    CAUSE_NV
+                } else {
+                    0
+                },
+            )
+        } else {
+            convert_float_width(operand.bits, source_width, destination_width, round)
+        };
+        operand.kind = value_kind_for_width(destination_width);
+        operand.bits = bits;
+        causes |= operand_causes;
+    }
+    (prepared, causes)
+}
+
+fn value_kind_for_width(width: usize) -> i32 {
+    match width {
+        2 => VALUE_BITS16,
+        4 => VALUE_BITS32,
+        8 => VALUE_BITS64,
+        _ => panic!("invalid Sail FP operation width {width}"),
+    }
+}
+
+fn exact_after_format_conversion(
+    operation: i32,
+    request: &SailCoreNumericRequest,
+    response: &mut SailCoreNumericResponse,
+) -> bool {
+    let source = request.operands[0].bits;
+    let width = request.element_width;
+    response.primary = if operation == operation::OP_FABS {
+        canonical(source, width) & !sign_mask(width)
+    } else if operation == operation::OP_FNEG {
+        canonical(source, width) ^ sign_mask(width)
+    } else if operation == operation::OP_FMOV || operation == operation::OP_FMOVCC {
+        canonical(source, width)
+    } else {
+        return false;
+    };
+    if is_nan(response.primary, width) {
+        response.primary_nan_origin = selected_nan(request)
+            .map(|(index, _, _)| NAN_OPERAND0 + index as i32)
+            .unwrap_or(NAN_GENERATED_DEFAULT);
+    }
+    true
 }
 
 fn is_transcendental(op: i32) -> bool {
@@ -1338,5 +1421,73 @@ mod tests {
         let response = execute(operation::OP_FCVTD, &request).unwrap();
         assert_eq!(response.primary, 0xfff8_0024_6000_0000);
         assert_eq!(response.primary_nan_origin, NAN_OPERAND0);
+    }
+
+    #[test]
+    fn immediate_source_format_is_converted_before_binary_operation() {
+        let mut request = binary_request(8, 1.0_f32.to_bits() as u64, 0.0_f64.to_bits());
+        request.operands[0].kind = VALUE_BITS32;
+        let response = execute(operation::OP_FADD, &request).unwrap();
+        assert_eq!(response.primary, 1.0_f64.to_bits());
+        assert_eq!(response.generated_causes, 0);
+    }
+
+    #[test]
+    fn immediate_source_conversion_causes_are_combined_with_operation_causes() {
+        let mut request = binary_request(4, f64::MAX.to_bits(), 0.0_f32.to_bits() as u64);
+        request.operands[0].kind = VALUE_BITS64;
+        let response = execute(operation::OP_FADD, &request).unwrap();
+        assert_eq!(response.primary, f32::INFINITY.to_bits() as u64);
+        assert_eq!(response.generated_causes, CAUSE_OF | CAUSE_NX);
+    }
+
+    #[test]
+    fn immediate_source_format_is_converted_for_flags_result() {
+        let request = SailCoreNumericRequest {
+            valid: true,
+            element_width: 8,
+            result_kind: RESULT_VALUE_FLAGS,
+            operand_count: 2,
+            operands: [
+                SailCoreNumericOperand {
+                    valid: true,
+                    kind: VALUE_BITS32,
+                    bits: 1.0_f32.to_bits() as u64,
+                },
+                SailCoreNumericOperand {
+                    valid: true,
+                    kind: VALUE_BITS64,
+                    bits: 1.0_f64.to_bits(),
+                },
+                SailCoreNumericOperand::default(),
+            ],
+            ..SailCoreNumericRequest::default()
+        };
+        let response = execute(operation::OP_FCMP, &request).unwrap();
+        assert_eq!(response.flags_value, 0b1000);
+        assert_eq!(response.generated_causes, 0);
+    }
+
+    #[test]
+    fn exact_operation_runs_after_immediate_source_conversion() {
+        let request = SailCoreNumericRequest {
+            valid: true,
+            element_width: 8,
+            result_kind: RESULT_BITS64,
+            operand_count: 1,
+            operands: [
+                SailCoreNumericOperand {
+                    valid: true,
+                    kind: VALUE_BITS32,
+                    bits: (-1.0_f32).to_bits() as u64,
+                },
+                SailCoreNumericOperand::default(),
+                SailCoreNumericOperand::default(),
+            ],
+            ..SailCoreNumericRequest::default()
+        };
+        let response = execute(operation::OP_FABS, &request).unwrap();
+        assert_eq!(response.primary, 1.0_f64.to_bits());
+        assert_eq!(response.generated_causes, 0);
     }
 }

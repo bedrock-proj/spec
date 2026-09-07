@@ -1,36 +1,20 @@
 function vector_special_vclr_compute(instruction : Decoded_instruction, state : Cpu_state) -> option(Vector_compute_result) = {
-    let operation = instruction.form.operation;
-    let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
-    let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
-    let zero_vector = zero_vector_bytes(active_bytes);
-    let fp_form : bool = match condition_size_field(instruction.fields) {
-        Some(selector) => selector >= 5,
-        None() => false,
-    };
-    if true then {
-        match vector_register_index(instruction, Operand_dst) {
-            Some(destination) => {
-                var updated = state;
-                updated.vector_registers[unsigned(destination)] = vector_zero_low_bytes(
-                    state.vector_registers[unsigned(destination)], active_bytes);
-                Some(VectorComputeState(updated))
-            },
-            None() => None(),
-        }
-    } else {
-        None()
+    match vector_register_index(instruction, Operand_dst) {
+        Some(destination) => {
+            var updated = state;
+            updated.vector_registers[unsigned(destination)] = vector_zero_low_bytes(
+                state.vector_registers[unsigned(destination)], active_bytes);
+            Some(VectorComputeState(updated))
+        },
+        None() => None(),
     }
 }
 
 function vector_special_vdup_compute(instruction : Decoded_instruction, state : Cpu_state) -> option(Vector_compute_result) = {
-    let operation = instruction.form.operation;
     let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
     let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
-    let zero_vector = zero_vector_bytes(active_bytes);
     let fp_form : bool = match condition_size_field(instruction.fields) {
         Some(selector) => selector >= 5,
         None() => false,
@@ -69,8 +53,6 @@ function vector_special_vextract_compute(instruction : Decoded_instruction, stat
     let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
     let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
-    let zero_vector = zero_vector_bytes(active_bytes);
     let fp_form : bool = match condition_size_field(instruction.fields) {
         Some(selector) => selector >= 5,
         None() => false,
@@ -111,32 +93,21 @@ function vector_special_vextract_compute(instruction : Decoded_instruction, stat
 }
 
 function vector_special_vindex_compute(instruction : Decoded_instruction, state : Cpu_state) -> option(Vector_compute_result) = {
-    let operation = instruction.form.operation;
     let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
     let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
-    let zero_vector = zero_vector_bytes(active_bytes);
-    let fp_form : bool = match condition_size_field(instruction.fields) {
-        Some(selector) => selector >= 5,
-        None() => false,
-    };
-    if true then {
-        match vector_register_index(instruction, Operand_dst) {
-            Some(destination) => {
-                var updated = state;
-                updated.vector_registers[unsigned(destination)] = vector_index_image(
-                    vector_zero_low_bytes(state.vector_registers[unsigned(destination)], active_bytes),
-                    0,
-                    lanes,
-                    element_bytes,
-                );
-                Some(VectorComputeState(updated))
-            },
-            None() => None(),
-        }
-    } else {
-        None()
+    match vector_register_index(instruction, Operand_dst) {
+        Some(destination) => {
+            var updated = state;
+            updated.vector_registers[unsigned(destination)] = vector_index_image(
+                vector_zero_low_bytes(state.vector_registers[unsigned(destination)], active_bytes),
+                0,
+                lanes,
+                element_bytes,
+            );
+            Some(VectorComputeState(updated))
+        },
+        None() => None(),
     }
 }
 
@@ -145,8 +116,6 @@ function vector_special_vinsert_compute(instruction : Decoded_instruction, state
     let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
     let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
-    let zero_vector = zero_vector_bytes(active_bytes);
     let fp_form : bool = match condition_size_field(instruction.fields) {
         Some(selector) => selector >= 5,
         None() => false,
@@ -188,96 +157,63 @@ function vector_special_vinsert_compute(instruction : Decoded_instruction, state
 }
 
 function vector_special_vlcadd_compute(instruction : Decoded_instruction, state : Cpu_state) -> option(Vector_compute_result) = {
-    let operation = instruction.form.operation;
     let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
     let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
-    let zero_vector = zero_vector_bytes(active_bytes);
-    let fp_form : bool = match condition_size_field(instruction.fields) {
-        Some(selector) => selector >= 5,
-        None() => false,
-    };
-    if true then {
-        match (operand_named(instruction, Operand_offset), operand_named(instruction, Operand_dst)) {
-            (Some(offset), Some(dst)) => {
-                let index = unsigned(dst.value[3 .. 0]);
-                var updated = state;
-                updated.registers[index] = add_bits(
-                    state.registers[index],
-                    get_slice_int(64, signed(immediate_value(offset)) * lanes, 0),
-                );
-                Some(VectorComputeState(updated))
-            },
-            _ => None(),
-        }
-    } else {
-        None()
+    match (operand_named(instruction, Operand_offset), operand_named(instruction, Operand_dst)) {
+        (Some(offset), Some(dst)) => {
+            let index = unsigned(dst.value[3 .. 0]);
+            var updated = state;
+            updated.registers[index] = add_bits(
+                state.registers[index],
+                get_slice_int(64, signed(immediate_value(offset)) * lanes, 0),
+            );
+            Some(VectorComputeState(updated))
+        },
+        _ => None(),
     }
 }
 
 function vector_special_vlcnt_compute(instruction : Decoded_instruction, state : Cpu_state) -> option(Vector_compute_result) = {
-    let operation = instruction.form.operation;
     let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
     let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
-    let zero_vector = zero_vector_bytes(active_bytes);
-    let fp_form : bool = match condition_size_field(instruction.fields) {
-        Some(selector) => selector >= 5,
-        None() => false,
-    };
-    if true then {
-        match operand_named(instruction, Operand_dst) {
-            Some(dst) => {
-                var updated = state;
-                updated.registers[unsigned(dst.value[3 .. 0])] = get_slice_int(64, lanes, 0);
-                Some(VectorComputeState(updated))
-            },
-            None()    => None(),
-        }
-    } else {
-        None()
+    match operand_named(instruction, Operand_dst) {
+        Some(dst) => {
+            var updated = state;
+            updated.registers[unsigned(dst.value[3 .. 0])] = get_slice_int(64, lanes, 0);
+            Some(VectorComputeState(updated))
+        },
+        None()    => None(),
     }
 }
 
 function vector_special_vmov_compute(instruction : Decoded_instruction, state : Cpu_state) -> option(Vector_compute_result) = {
-    let operation = instruction.form.operation;
     let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
     let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
-    let zero_vector = zero_vector_bytes(active_bytes);
-    let fp_form : bool = match condition_size_field(instruction.fields) {
-        Some(selector) => selector >= 5,
-        None() => false,
-    };
-    if true then {
-        match (vector_register_index(instruction, Operand_src), vector_register_index(instruction, Operand_dst)) {
-            (Some(source), Some(destination)) => {
-                var updated = state;
-                updated.vector_registers[unsigned(destination)] = match predicate_register_index(
-                    instruction,
-                    Operand_govern,
-                ) {
-                    Some(predicate) => vector_merge_image(
-                        state.vector_registers[unsigned(destination)],
-                        state.vector_registers[unsigned(source)],
-                        state.predicate_registers[unsigned(predicate)],
-                        0,
-                        lanes,
-                        element_bytes,
-                    ),
-                    None() => vector_replace_low_bytes(
-                        state.vector_registers[unsigned(destination)],
-                        state.vector_registers[unsigned(source)],
-                        active_bytes),
-                };
-                Some(VectorComputeState(updated))
-            },
-            _ => None(),
-        }
-    } else {
-        None()
+    match (vector_register_index(instruction, Operand_src), vector_register_index(instruction, Operand_dst)) {
+        (Some(source), Some(destination)) => {
+            var updated = state;
+            updated.vector_registers[unsigned(destination)] = match predicate_register_index(
+                instruction,
+                Operand_govern,
+            ) {
+                Some(predicate) => vector_merge_image(
+                    state.vector_registers[unsigned(destination)],
+                    state.vector_registers[unsigned(source)],
+                    state.predicate_registers[unsigned(predicate)],
+                    0,
+                    lanes,
+                    element_bytes,
+                ),
+                None() => vector_replace_low_bytes(
+                    state.vector_registers[unsigned(destination)],
+                    state.vector_registers[unsigned(source)],
+                    active_bytes),
+            };
+            Some(VectorComputeState(updated))
+        },
+        _ => None(),
     }
 }

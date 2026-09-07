@@ -1,81 +1,68 @@
-"""C ABI document projection from the typed calling-convention catalog."""
-
-from abi.c.model import CAbiProject
-from engine.generation import (
-    AuthoredTexArtifactGenerator,
-    GeneratedArtifact,
-    GeneratedArtifactSet,
-)
+"""C ABI document serialization from selected semantic rows."""
+from __future__ import annotations
+from engine.documents.abi import CReturnRulesProjection, CMemoryOrdersProjection, CAtomicLoweringsProjection
+from abi.c.model.projection import project_c_abi
+from artifacts._shared.documents import authored_tex_generate, build_document, authored_document_source
 
 
-_RETURN_TABLE_INPUT = (
-    r"\BedrockGeneratedCReturnRegisterTable"
-)
-_MEMORY_ORDER_TABLE_INPUT = r"\BedrockGeneratedCMemoryOrderTable"
-_ATOMIC_PRIMITIVE_TABLE_INPUT = r"\BedrockGeneratedCAtomicPrimitiveTable"
-_FETCH_RMW_TABLE_INPUT = r"\BedrockGeneratedCFetchRMWTable"
+def _inputs(context):
+    isa = context.workspace.require_provider("isa")
+    project = context.workspace.require_provider("abi.c")
+    projection = context.shared_result((project_c_abi, id(project), id(isa)), lambda: project_c_abi(project, isa))
+    return {"isa": isa, "abi.c": projection}
 
 
-class Generator(AuthoredTexArtifactGenerator):
-    """Publish authored prose with calling-convention tables derived from YAML."""
-
-    def generate(self, context) -> GeneratedArtifactSet:
-        provider = context.require_provider("abi.c")
-        if not isinstance(provider, CAbiProject):
-            raise TypeError("abi.c provider must be a CAbiProject")
-        generated = super().generate(context)
-        return_table = _return_register_table(provider, context.workspace)
-        memory_order_table = _memory_order_table(provider, context.workspace)
-        atomic_primitive_table = _atomic_lowering_table(
-            provider, context.workspace, fetch=False
-        )
-        fetch_rmw_table = _atomic_lowering_table(
-            provider, context.workspace, fetch=True
-        )
-        artifacts = tuple(
-            GeneratedArtifact(
-                artifact.relative_path,
-                artifact.content
-                .replace(_RETURN_TABLE_INPUT, return_table)
-                .replace(_MEMORY_ORDER_TABLE_INPUT, memory_order_table)
-                .replace(_ATOMIC_PRIMITIVE_TABLE_INPUT, atomic_primitive_table)
-                .replace(_FETCH_RMW_TABLE_INPUT, fetch_rmw_table),
-            )
-            for artifact in generated.artifacts
-        )
-        if any("BedrockGeneratedC" in item.content for item in artifacts):
-            raise AssertionError("C ABI table projection remained unresolved")
-        return GeneratedArtifactSet(artifacts, generated.artifact_id)
+def render_source(definition, context):
+    return authored_document_source(definition, context, _inputs(context), render_fragment=render_fragment)
 
 
-def _return_register_table(project: CAbiProject, workspace) -> str:
-    convention = project.calling_convention
-    classes = {
-        reference: project.register_classes.resolve(reference)
-        for reference in convention.register_classes
-    }
-    rows: list[str] = []
-    for reference in convention.value_classes:
-        value_class = project.value_classes.resolve(reference)
+def validate(definition, context):
+    render_source(definition, context)
+
+
+def generate(definition, context):
+    return authored_tex_generate(definition, render_source(definition, context))
+
+
+def build(definition, context, *, compile_pdf, latexmk="latexmk"):
+    return build_document(definition, context, compile_pdf=compile_pdf, latexmk=latexmk)
+
+
+def render_fragment(projection, labels):
+    if isinstance(projection, CReturnRulesProjection): return _return_register_table(projection)
+    if isinstance(projection, CMemoryOrdersProjection): return _memory_order_table(projection)
+    if isinstance(projection, CAtomicLoweringsProjection): return _atomic_lowering_table(projection)
+    raise TypeError(f"unsupported C ABI fragment {type(projection).__name__}")
+
+
+def _return_register_table(projection) -> str:
+    rows = []
+    for value in projection.rows:
+        value_class = value.definition
+        registers = value.result_registers
+        component_roles = value.result_component_roles
         policy = value_class.result
-        register_class = (
-            None
-            if policy.register_class is None
-            else classes.get(policy.register_class)
-        )
-        names = () if register_class is None else tuple(
-            workspace.resolve(item).id
-            for item in register_class.results[: policy.units or 0]
-        )
+        names = tuple(register.id for register in registers)
         if policy.mode == "sret":
-            rule = "sret pointer in R0; result pointer in R0"
+            rule = f"sret pointer in {projection.sret_register.id}; result pointer in {names[0]}"
         elif policy.mode == "size_dependent":
             direct = ":".join(reversed(names))
             rule = f"up to {policy.direct_maximum_bytes} bytes in {direct}; larger values use sret"
-        elif len(names) == 2 and value_class.id == "FLOAT_PAIR":
-            rule = f"real component in {names[0]}; imaginary component in {names[1]}"
         else:
-            rule = ":".join(reversed(names))
+            kinds_by_roles = {}
+            for kind in value_class.kinds:
+                kinds_by_roles.setdefault(component_roles[kind], []).append(kind)
+            rules = []
+            for roles, kinds in kinds_by_roles.items():
+                meaning = (
+                    "; ".join(f"{role} component in {name}" for role, name in zip(roles, names, strict=True))
+                    if roles else ":".join(reversed(names))
+                )
+                rules.append(
+                    f"{', '.join(kinds)}: {meaning}"
+                    if len(kinds_by_roles) > 1 else meaning
+                )
+            rule = "; ".join(rules)
         kinds = ", ".join(value_class.kinds)
         rows.append(f"{_code(kinds)} & {_code(rule)}\\\\")
     return "\n".join(
@@ -96,19 +83,17 @@ def _return_register_table(project: CAbiProject, workspace) -> str:
     )
 
 
-def _memory_order_table(project: CAbiProject, workspace) -> str:
-    inventory = project.namespaces["base"].memory_order_inventory
+def _memory_order_table(projection) -> str:
     rows = []
-    for entity_id in inventory.declared:
-        mapping = project.namespaces["base"].memory_orders[entity_id]
+    for mapping, load, store, thread_fence in projection.rows:
         rows.append(
             " & ".join(
                 (
-                    _code(entity_id.lower()),
+                    _code(mapping.id.lower()),
                     _code(mapping.instruction_order),
-                    _sequence(mapping.load, "load", workspace),
-                    _sequence(mapping.store, "store", workspace),
-                    _sequence(mapping.thread_fence, "access", workspace),
+                    _sequence(load, "load"),
+                    _sequence(store, "store"),
+                    _sequence(thread_fence, "access"),
                 )
             )
             + r"\\"
@@ -131,13 +116,15 @@ def _memory_order_table(project: CAbiProject, workspace) -> str:
     )
 
 
-def _sequence(sequence, access_name: str, workspace) -> str:
+def _sequence(sequence, access_name: str) -> str:
     if sequence is None:
         return "---"
     if len(sequence) == 0:
         return "zero instructions"
     names = [
-        access_name if item == "access" else workspace.resolve(item).instruction.mnemonic
+        access_name
+        if item == "access"
+        else item.instruction.mnemonic
         for item in sequence
     ]
     return _code("; ".join(names))
@@ -148,18 +135,13 @@ def _code(value: str) -> str:
     return rf"\texttt{{{escaped}}}"
 
 
-def _atomic_lowering_table(project: CAbiProject, workspace, *, fetch: bool) -> str:
-    inventory = project.namespaces["base"].atomic_lowering_inventory
-    rows: list[str] = []
-    for entity_id in inventory.declared:
-        lowering = project.namespaces["base"].atomic_lowerings[entity_id]
-        is_fetch = entity_id.startswith("FETCH_")
-        if is_fetch != fetch:
-            continue
+def _atomic_lowering_table(projection) -> str:
+    rows = []
+    for lowering, resolved_instructions in projection.rows:
         operations = ", ".join(lowering.c_operations)
         instructions = ", ".join(
-            workspace.resolve(item).instruction.mnemonic
-            for item in lowering.instructions
+            item.instruction.mnemonic
+            for item in resolved_instructions
         )
         if lowering.strategy == "aligned_access":
             rule = f"aligned {instructions} access plus the order sequence"
@@ -168,7 +150,7 @@ def _atomic_lowering_table(project: CAbiProject, workspace, *, fetch: bool) -> s
         else:
             rule = instructions
         rows.append(f"{_code(operations)} & {_code(rule)}\\\\")
-    caption = "C Fetch RMW Lowering" if fetch else "Native Atomic Primitive Quick Reference"
+    caption = "C Atomic Lowering"
     return "\n".join(
         (
             rf"\BedrockTableCaption{{{caption}}}",

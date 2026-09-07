@@ -85,12 +85,22 @@ function resume_transaction_inner(previous : Execution_result, response : Transa
                         } else {
                             if not_bool(response.success) &
                                 (response.fault_kind == TranslationFault | response.fault_kind == AccessFault) then {
-                                architectural_memory_fault(
-                                    previous,
-                                    response.fault_kind,
-                                    response.fault_cause,
-                                    response.detail,
-                                )
+                                match response.fault_range {
+                                    Some(range) => architectural_memory_fault(
+                                        { previous with request = { previous.request with
+                                            effective_address = range.effective_address,
+                                            linear_address = range.linear_address,
+                                            width = range.width,
+                                        } },
+                                        response.fault_kind,
+                                        response.fault_cause,
+                                        response.detail,
+                                    ),
+                                    None() => faulted(
+                                        previous.state, previous.pending.operation,
+                                        InvalidControlState, "missing memory fault range"
+                                    ),
+                                }
                             } else {
                                 if not_bool(response.success) then {
                                     transaction_faulted(previous, response.fault_kind, response.detail)

@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from abi.c.model.projection import project_c_abi
+
+from engine.artifacts.definition import load_artifact_definition
+
+from engine.artifacts.registry import ArtifactGeneratorRegistry, load_artifact_registry
+from engine.artifacts.generate import artifact_context
+
 from importlib import import_module
 import os
 from pathlib import Path
@@ -8,10 +15,10 @@ import subprocess
 import tempfile
 import unittest
 
-from abi.c.model import CAbiProject
-from engine.generation import ArtifactDefinition, ArtifactGenerationContext
-from engine.workspace import SpecWorkspace
-from engine.yaml_document import YamlDocumentLoader
+from abi.c.model.project import CAbiProject
+from engine.artifacts.definition import ArtifactDefinition
+from engine.workspace import load_workspace
+from engine.source.yaml import load_yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,29 +27,30 @@ ROOT = Path(__file__).resolve().parents[1]
 class LlvmCAbiArtifactTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.workspace = SpecWorkspace.load(ROOT)
-        schema = YamlDocumentLoader().mapping(ROOT / "artifacts/schema.yaml")
-        definition = ArtifactDefinition.load(
-            ROOT / "artifacts/llvm-c-abi/artifact.yaml", schema
+        cls.workspace = load_workspace(ROOT)
+        definition = load_artifact_definition(
+            ROOT / "artifacts/llvm-c-abi/artifact.yaml"
         )
         cls.definition = definition
-        generated = (
-            import_module("artifacts.llvm-c-abi.generator")
-            .Generator(definition)
-            .generate(ArtifactGenerationContext.create(cls.workspace, ROOT))
+        generated = import_module("artifacts.llvm-c-abi.generator").generate(
+            definition,
+            artifact_context(
+                load_artifact_registry(cls.workspace), cls.workspace, ROOT
+            ),
         )
         cls.generator_module = import_module("artifacts.llvm-c-abi.generator")
         project = cls.workspace.require_provider("abi.c")
         if not isinstance(project, CAbiProject):
             raise TypeError("workspace abi.c provider must be a CAbiProject")
         cls.project = project
+        cls.abi_projection = project_c_abi(project, cls.workspace.require_provider("isa"))
         cls.catalog = generated.artifact(definition.outputs["catalog"]).content
         cls.calling_convention = generated.artifact(
             definition.outputs["calling-convention"]
         ).content
         cls.calling_convention_projection = (
             cls.generator_module._project_calling_convention(
-                project, project.calling_convention, cls.workspace
+                cls.abi_projection
             )
         )
 
@@ -179,16 +187,11 @@ class LlvmCAbiArtifactTests(unittest.TestCase):
         self.assertTrue(
             include_root.is_dir(), f"LLVM include directory is missing: {include_root}"
         )
-        registers = {
-            register
-            for rule in self.calling_convention_projection.return_rules
-            for register in rule.registers
-        } | set(self.calling_convention_projection.all_callee_saved)
-        wrapper = ['include "llvm/Target/Target.td"']
-        wrapper.extend(
-            f'def {register} : Register<"{register}">;'
-            for register in sorted(registers)
-        )
+        target_root = Path(project_root) / "llvm/lib/Target/Bedrock"
+        wrapper = [
+            'include "llvm/Target/Target.td"',
+            'include "BedrockRegisterInfo.td"',
+        ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             generated = root / "BedrockGenCallingConv.td"
@@ -201,6 +204,8 @@ class LlvmCAbiArtifactTests(unittest.TestCase):
                     str(tablegen),
                     "-I",
                     str(include_root),
+                    "-I",
+                    str(target_root),
                     "-print-records",
                     str(source),
                 ],

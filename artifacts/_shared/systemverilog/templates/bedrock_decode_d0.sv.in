@@ -1,0 +1,92 @@
+// Generated from canonical Decode IR. Do not edit.
+module bedrock_decode_d0
+  import bedrock_decode_pkg::*;
+(
+  input  logic valid_i,
+  input  opcode_class_e opcode_class_i,
+  input  logic [BEDROCK_OPCODE_BITS-1:0] opcode_i,
+  output d0_result_t result_o,
+  output d0_ea_result_t ea_result_o
+);
+  typedef struct packed {
+    logic valid;
+    form_id_e form;
+    ea_layout_e ea_layout;
+    operand_ea_width_e [BEDROCK_EA_SLOTS-1:0] ea_widths;
+    ea_profile_e [BEDROCK_EA_SLOTS-1:0] ea_profiles;
+  } d0_selection_t;
+
+  logic class_raw_match;
+  d0_selection_t class_selection;
+  @@FORM_BITS_TYPE@@ class_form;
+  ea_span_result_t alt_span;
+@@FORM_DECLARATIONS@@
+@@TREE_DECLARATIONS@@
+
+@@EA_SPAN_FUNCTION@@
+
+@@OPCODE_CLASS_BYTES_FUNCTION@@
+
+@@OPERATOR_SPACE_FUNCTION@@
+
+@@FORM_ASSIGNMENTS@@
+@@TREE_ASSIGNMENTS@@
+
+  always_comb begin
+    result_o = '0;
+    result_o.status = D0_INVALID_INPUT;
+    result_o.opcode_class = opcode_class_i;
+    result_o.operator_space = OPERATOR_SPACE_NONE;
+    result_o.opcode = opcode_i;
+    ea_result_o = '0;
+    ea_result_o.low_raw = opcode_i[6:0];
+    unique case (opcode_class_i)
+      OPCODE_CLASS_MEDIUM: begin
+        ea_result_o.alt_raw = {opcode_i[16:14], opcode_i[3:0]};
+      end
+      OPCODE_CLASS_LONG, OPCODE_CLASS_EXTRALONG, OPCODE_CLASS_XXLONG: begin
+        ea_result_o.alt_raw = opcode_i[13:7];
+      end
+      default: begin end
+    endcase
+    ea_result_o.base_cursor = opcode_class_bytes(opcode_class_i);
+    result_o.alt_raw = ea_result_o.alt_raw;
+    result_o.base_cursor = ea_result_o.base_cursor;
+    ea_result_o.post_alt_cursor = ea_result_o.base_cursor;
+    class_raw_match = 1'b0;
+    class_selection = '0;
+    class_form = '0;
+    unique case (opcode_class_i)
+@@CLASS_CASES@@
+      default: begin end
+    endcase
+    ea_result_o.ea_profiles = class_selection.ea_profiles;
+    alt_span = encoded_ea_span(
+      class_selection.ea_profiles[BEDROCK_EA_ALT_SLOT],
+      ea_result_o.alt_raw
+    );
+    if (alt_span.valid)
+      ea_result_o.post_alt_cursor =
+        ea_result_o.base_cursor + {2'b0, alt_span.descriptor_bytes};
+    if (valid_i) begin
+      result_o.form_high_decode = BEDROCK_FORM_HIGH_COUNT'(1) << (class_form >> 5);
+      result_o.form_low_decode = 32'h00000001 << (class_form & 31);
+      result_o.operator_space =
+        operator_space_from_opcode(opcode_class_i, opcode_i);
+      result_o.status = D0_UNASSIGNED_OPCODE;
+      if (class_selection.valid) begin
+        result_o.status = D0_SUCCESS;
+        result_o.form = form_id_e'(class_form);
+        result_o.ea_layout = class_selection.ea_layout;
+        result_o.ea_widths = class_selection.ea_widths;
+        result_o.ea_profiles = class_selection.ea_profiles;
+      end else if (class_raw_match) begin
+        result_o.status = D0_CONSTRAINT_REJECTED;
+      end
+    end
+    ea_result_o.status = result_o.status;
+    ea_result_o.ea_layout = result_o.ea_layout;
+    ea_result_o.ea_widths = result_o.ea_widths;
+    ea_result_o.ea_profiles = result_o.ea_profiles;
+  end
+endmodule

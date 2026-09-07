@@ -197,19 +197,20 @@ const INSTRUCTION_TEST_RECORD_SCRIPT: &str = r#"
 import sys
 from pathlib import Path
 
-from engine.composition import IsaConfiguration, SailComposer
-from engine.render import SailCatalogRenderer
-from engine.workspace import SpecWorkspace
-from engine.yaml_document import YamlDocumentLoader
+from engine.artifacts.generate import artifact_context
+from engine.artifacts.registry import load_artifact_registry
+from engine.isa.encoding import representative_record
+from engine.workspace import load_workspace
 
 root = Path(sys.argv[1]).resolve()
-workspace = SpecWorkspace.load(root)
-project = workspace.require_provider("isa")
-artifact = YamlDocumentLoader().mapping(root / "artifacts/sail-model/artifact.yaml")
-configuration = IsaConfiguration.resolve(project, tuple(artifact["extensions"]))
-program = SailComposer().compose(project, configuration)
-forms = {item.key: item.representative_record
-         for item in SailCatalogRenderer().project(program).forms}
+workspace = load_workspace(root)
+registry = load_artifact_registry(workspace)
+context = artifact_context(registry, workspace, root / "output")
+program = registry.entrypoint("sail-model", "project_program")(
+    registry.definition("sail-model"), context
+)
+forms = {f"{item.encoding_class.name}.{item.instruction.mnemonic.lower()}.{item.form.id}": representative_record(item)
+         for item in program.forms}
 selected = (
     ("RET", "extrashort.ret.plain"),
     ("CALLCC_R0_FALSE", "long.callcc.rn_r"),

@@ -11,8 +11,9 @@ SPEC_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LLVM_ROOT = SPEC_ROOT.parent / "llvm-project"
 sys.path.insert(0, str(SPEC_ROOT))
 
-from engine.generation import ArtifactGeneratorRegistry  # noqa: E402
-from engine.workspace import SpecWorkspace  # noqa: E402
+from engine.artifacts.registry import load_artifact_registry  # noqa: E402
+from engine.artifacts.generate import artifact_context  # noqa: E402
+from engine.workspace import load_workspace  # noqa: E402
 
 DESTINATIONS = {
     ("llvm-mc-tablegen", "BedrockGenISACatalog.td"):
@@ -48,11 +49,12 @@ def main() -> int:
     if not (llvm_root / "llvm" / "CMakeLists.txt").is_file():
         parser.error(f"not an llvm-project checkout: {llvm_root}")
 
-    workspace = SpecWorkspace.load(SPEC_ROOT)
-    registry = ArtifactGeneratorRegistry.discover(workspace)
+    workspace = load_workspace(SPEC_ROOT)
+    registry = load_artifact_registry(workspace)
+    context = artifact_context(registry, workspace, SPEC_ROOT)
     stale: list[Path] = []
     for artifact_id in ("llvm-mc-tablegen", "llvm-elf-abi", "llvm-c-abi"):
-        generated = registry.generate(artifact_id, workspace, SPEC_ROOT)
+        generated = context.generate(artifact_id, None)
         for artifact in generated.artifacts:
             key = (artifact_id, str(artifact.relative_path))
             try:

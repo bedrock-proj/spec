@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from engine.artifacts.definition import load_artifact_definition
+
+from engine.artifacts.registry import ArtifactGeneratorRegistry, load_artifact_registry
+from engine.artifacts.generate import artifact_context
+
 from importlib import import_module
 import os
 from pathlib import Path
@@ -7,17 +12,27 @@ import subprocess
 import tempfile
 import unittest
 
-from engine.encoding import EncodingForm, ExcludedOperandConstraint
-from engine.encoding_architecture import ENCODING_CLASSES_BY_WIDTH
-from engine.generation import ArtifactDefinition, ArtifactGenerationContext
-from engine.project import InstructionBundle, IsaProject
-from engine.type_system import (
+from engine.isa.configuration import IsaConfiguration
+from engine.isa.decoding import project_decode
+from engine.isa.control_registers import control_register_selector_members
+from engine.isa.encoding import (
+    EncodingForm,
+    ExcludedOperandConstraint,
+    ResolvedEaRead,
+)
+from engine.isa.ea import CompactExtensionEAMode
+from engine.isa.encoding_architecture import ENCODING_CLASSES_BY_WIDTH
+from engine.artifacts.definition import ArtifactDefinition
+from engine.isa.catalog import InstructionBundle
+from engine.isa.project import IsaProject
+from engine.isa.types import (
     ControlRegisterSelectorPayloadType,
+    EnumConditionFieldType,
     EffectiveAddressFieldType,
     RegisterSelectorPayloadType,
 )
-from engine.workspace import SpecWorkspace
-from engine.yaml_document import YamlDocumentLoader
+from engine.workspace import load_workspace
+from engine.source.yaml import load_yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,21 +41,37 @@ ROOT = Path(__file__).resolve().parents[1]
 class LlvmMcTableGenArtifactTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.workspace = SpecWorkspace.load(ROOT)
+        cls.workspace = load_workspace(ROOT)
         project = cls.workspace.require_provider("isa")
         if not isinstance(project, IsaProject):
             raise TypeError("workspace isa provider must be an IsaProject")
         cls.project = project
-        schema = YamlDocumentLoader().mapping(ROOT / "artifacts/schema.yaml")
-        definition = ArtifactDefinition.load(
-            ROOT / "artifacts/llvm-mc-tablegen/artifact.yaml", schema
+        definition = load_artifact_definition(
+            ROOT / "artifacts/llvm-mc-tablegen/artifact.yaml"
         )
-        generator_type = import_module("artifacts.llvm-mc-tablegen.generator").Generator
-        generator = generator_type(definition)
-        generated = generator.generate(
-            ArtifactGenerationContext.create(cls.workspace, ROOT)
+        module = import_module("artifacts.llvm-mc-tablegen.generator")
+        context = artifact_context(
+            load_artifact_registry(cls.workspace), cls.workspace, ROOT
         )
-        cls.projection = generator.projection
+        generated = module.generate(definition, context)
+        configuration = IsaConfiguration.resolve(project.catalog)
+        decoded = project_decode(
+            tuple(project.catalog.instructions.resolve(reference)
+                  for reference in project.catalog.instruction_order),
+            configuration=configuration, field_types=project.types.field_types,
+            payload_types=project.types.payload_types,
+            ea_modes=project.catalog.ea_modes, registers=project.registers,
+            cpuid=project.cpuid,
+        )
+        cls.decoded = decoded
+        controls = tuple(
+            entry for namespace in project.control_registers.namespaces.values()
+            if namespace.owner in configuration.owners
+            for entry in control_register_selector_members(namespace)
+        )
+        cls.projection = module.project_tablegen(
+            decoded, control_register_selectors=controls,
+        )
         cls.catalog = generated.artifact(definition.outputs["catalog"]).content
 
     @staticmethod
@@ -89,11 +120,7 @@ class LlvmMcTableGenArtifactTests(unittest.TestCase):
 
     def test_vector_table_covers_forms_and_projects_alias_policy(self) -> None:
         expected = {
-            self._form_identifier(bundle, form): bool(
-                dict(bundle.instruction)
-                .get("assembly", {})
-                .get("width_suffix_aliases", False)
-            )
+            self._form_identifier(bundle, form): bundle.instruction.width_suffix_aliases
             for bundle in self.project.catalog.instructions.values()
             if bundle.instruction.route == "vector"
             for form in bundle.encodings.forms
@@ -124,6 +151,97 @@ class LlvmMcTableGenArtifactTests(unittest.TestCase):
                     ),
                 )
 
+    def test_codec_records_project_canonical_tail_operand_order(self) -> None:
+        owners = {
+            id(bundle.instruction): bundle.owner for bundle in self.decoded.bundles
+        }
+        canonical = {
+            f"{owners[id(resolved.instruction)]}.{resolved.instruction.mnemonic}.{resolved.form.id}": resolved
+            for resolved in self.decoded.forms
+        }
+        mixed_layouts = 0
+
+        for records, vector in (
+            (self.projection.scalar_forms, False),
+            (self.projection.vector_forms, True),
+        ):
+            for record in records:
+                with self.subTest(identifier=record.identifier):
+                    resolved = canonical[record.identifier]
+                    if vector:
+                        prefix_roles = tuple(
+                            field.field.role
+                            for field in resolved.fields
+                            if isinstance(field.definition, EnumConditionFieldType)
+                        )
+                    elif resolved.form.syntax.order_field is not None:
+                        order_field = resolved.form.field_for_marker(
+                            resolved.form.syntax.order_field
+                        )
+                        self.assertIsNotNone(order_field)
+                        assert order_field is not None
+                        prefix_roles = (order_field.role,)
+                    else:
+                        prefix_roles = ()
+                    roles = (
+                        *prefix_roles,
+                        *(operand.name for operand in resolved.display_order),
+                    )
+                    expected = tuple(
+                        roles.index(operation.operand.name)
+                        for operation in resolved.layout
+                    )
+                    self.assertEqual(record.tail_operand_order, expected)
+                    self.assertEqual(
+                        record.ea_operand_count,
+                        sum(
+                            isinstance(operation, ResolvedEaRead)
+                            for operation in resolved.layout
+                        ),
+                    )
+                    mixed_layouts += (
+                        0 < record.ea_operand_count < len(record.tail_operand_order)
+                    )
+
+        self.assertGreater(mixed_layouts, 0)
+
+    def test_ea_layouts_follow_profile_selectors_and_declared_extensions(self) -> None:
+        families = {
+            (family.owner, family.profile, family.name): family
+            for family in self.decoded.effective_addresses.descriptor_families
+        }
+        expected = {}
+        for profile in self.decoded.effective_addresses.profiles:
+            for entry in profile.compact_entries:
+                if entry.form is None:
+                    continue
+                descriptor_bytes = 0
+                if isinstance(entry.form.mode, CompactExtensionEAMode):
+                    family = families[
+                        entry.form.mode.catalog.owner,
+                        entry.form.mode.catalog.profile,
+                        entry.form.mode.extension.id,
+                    ]
+                    self.assertEqual(
+                        family.descriptor_bytes,
+                        entry.form.mode.extension.bytes,
+                    )
+                    self.assertFalse(any(form.payloads for form in family.forms))
+                    descriptor_bytes = family.descriptor_bytes
+                expected[profile.definition.profile, entry.raw] = (
+                    descriptor_bytes,
+                    entry.form.payload_width // 8,
+                )
+
+        actual = {
+            (layout.profile, layout.selector): (
+                layout.descriptor_bytes,
+                layout.payload_bytes,
+            )
+            for layout in self.projection.ea_layouts
+        }
+        self.assertEqual(actual, expected)
+
     def test_selector_metadata_comes_from_register_catalogs(self) -> None:
         selector_group_references = {
             payload_type.register_group
@@ -133,7 +251,7 @@ class LlvmMcTableGenArtifactTests(unittest.TestCase):
         expected_groups = [
             {
                 (register.id.lower(), register.encoding)
-                for register in self.project.registers.references.groups.resolve(
+                for register in self.project.registers.groups.resolve(
                     group_reference
                 ).registers.values()
                 if register.encoding is not None
@@ -147,7 +265,7 @@ class LlvmMcTableGenArtifactTests(unittest.TestCase):
             expected_groups.append(
                 {
                     (register.id.lower(), register.selector)
-                    for register in self.project.control_registers.references.registers.values()
+                    for register in self.project.control_registers.registers.values()
                 }
             )
         actual_groups: dict[int, set[tuple[str, int]]] = {}

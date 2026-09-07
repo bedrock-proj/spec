@@ -2,25 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from pathlib import Path
+from types import MappingProxyType
+
+
 import re
 from typing import NamedTuple
 
-from abi.elf.model import ElfAbiProject, RelocationExpression
+from abi.elf.model.projection import ElfAbiProjection, project_elf_abi
+from abi.elf.model.relocation_metasyntax import RelocationExpression
 from abi.elf.model.project import Relocation
-from engine.generation import (
-    ArtifactGenerationContext,
-    ArtifactGenerator,
-    GeneratedArtifact,
-    GeneratedArtifactSet,
-)
+from engine.artifacts.generate import ArtifactGenerationContext
+from engine.artifacts.definition import GeneratedArtifact, GeneratedArtifactSet
 
 
-_RELOCATIONS_OUTPUT = Path("ELFRelocs/Bedrock.def")
-_CATALOG_OUTPUT = Path("BedrockGenELFABI.inc")
 
-_LLD_EXPRESSION_SIGNATURES = {
+_LLD_EXPRESSION_SIGNATURES = MappingProxyType({
     "(+ symbol addend)": "ABS",
     "copy(symbol,symbol_size)": "ABS",
     "resolver((+ load_base addend))": "ABS",
@@ -37,7 +33,7 @@ _LLD_EXPRESSION_SIGNATURES = {
     "(+ tls(symbol) addend)": "TPREL",
     "(- (+ tlsdesc(symbol) addend) place)": "TLSDESC_PC",
     "tls_descriptor(symbol)": "TLSDESC",
-}
+})
 
 _MACROS = (
     "BEDROCK_ELF_RELOCATION",
@@ -69,49 +65,34 @@ class LlvmRelocationProjection(NamedTuple):
     relocation: Relocation
     lld_expression: str
 
-    @classmethod
-    def create(cls, relocation: Relocation) -> "LlvmRelocationProjection":
-        return cls(relocation, _lld_expression(relocation))
+
+def project_abi(project: ElfAbiProjection) -> tuple[LlvmRelocationProjection, ...]:
+    return tuple(
+        LlvmRelocationProjection(relocation, _lld_expression(relocation))
+        for relocation in sorted(project.relocations, key=lambda item: item.value)
+    )
 
 
-class ElfAbiProjection(NamedTuple):
-    relocations: tuple[LlvmRelocationProjection, ...]
+def _inputs(context) -> ElfAbiProjection:
+    project = context.workspace.require_provider("abi.elf")
+    isa = context.workspace.require_provider("isa")
+    return context.shared_result((project_elf_abi, id(project), id(isa)), lambda: project_elf_abi(project, isa))
 
 
-class Generator(ArtifactGenerator):
-    """Project ELF ABI entities into LLVM-friendly X-macro includes."""
+def validate(definition, context) -> None:
+    project_abi(_inputs(context))
 
-    @staticmethod
-    def project(project: ElfAbiProject) -> ElfAbiProjection:
-        return ElfAbiProjection(
-            tuple(
-                LlvmRelocationProjection.create(relocation)
-                for relocation in sorted(
-                    project.relocations.values(), key=lambda item: item.value
-                )
-            )
-        )
 
-    def generate(self, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
-        project = context.require_provider("abi.elf")
-        if not isinstance(project, ElfAbiProject):
-            raise TypeError("abi.elf provider must be an ElfAbiProject")
-        projection = self.project(project)
-        return GeneratedArtifactSet(
-            (
-                GeneratedArtifact(
-                    _RELOCATIONS_OUTPUT,
-                    _render_relocations(
-                        [item.relocation for item in projection.relocations]
-                    ),
-                ),
-                GeneratedArtifact(
-                    _CATALOG_OUTPUT,
-                    _render_catalog(project, projection, context.workspace),
-                ),
-            ),
-            self.artifact_id,
-        )
+def generate(definition, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
+    project = _inputs(context)
+    projection = project_abi(project)
+    return GeneratedArtifactSet(
+        (
+            GeneratedArtifact(definition.outputs["relocations"], _render_relocations([item.relocation for item in projection])),
+            GeneratedArtifact(definition.outputs["catalog"], _render_catalog(project, projection)),
+        ),
+        definition.id,
+    )
 
 
 def _render_relocations(relocations: list[Relocation]) -> str:
@@ -133,7 +114,7 @@ def _render_relocations(relocations: list[Relocation]) -> str:
 
 
 def _render_catalog(
-    project: ElfAbiProject, projection: ElfAbiProjection, workspace
+    project: ElfAbiProjection, projection: tuple[LlvmRelocationProjection, ...]
 ) -> str:
     lines = [
         "//===-- BedrockGenELFABI.inc - generated ELF ABI data --------*- C++ -*-===//",
@@ -168,7 +149,7 @@ def _render_catalog(
     ]
     lines.extend(_macro_defaults())
 
-    for projected in projection.relocations:
+    for projected in projection:
         relocation = projected.relocation
         result = relocation.result
         lines.append(
@@ -184,7 +165,7 @@ def _render_catalog(
                     projected.lld_expression,
                     _c_string(relocation.calculation.code),
                     _c_string(
-                        _field_id(workspace, relocation.field)
+                        project.relocation_fields[relocation.reference].id
                         if relocation.field
                         else ""
                     ),
@@ -192,63 +173,42 @@ def _render_catalog(
             )
             + ")"
         )
-        for target in relocation.relaxations:
-            lines.append(
-                f"BEDROCK_ELF_RELAXATION("
-                f"{relocation.id}, {project.relocations.resolve(target).id})"
-            )
+    for source, target in project.relaxations:
+        lines.append(f"BEDROCK_ELF_RELAXATION({source.id}, {target.id})")
 
-    for code_model in sorted(project.code_models.values(), key=lambda item: item.id):
+    for code_model in sorted(project.code_models, key=lambda item: item.id):
+        properties = dict(project.properties[code_model.reference])
         lines.append(
             f"BEDROCK_ELF_CODE_MODEL({code_model.id}, "
-            f"{_c_string(str(code_model.data['placement']))}, "
-            f"{_c_string(str(code_model.data['strategy']))})"
+            f"{_c_string(str(properties[('placement',)]))}, "
+            f"{_c_string(str(properties[('strategy',)]))})"
         )
-        for code_relocation in code_model.default_relocations:
-            lines.append(
-                f"BEDROCK_ELF_CODE_MODEL_RELOCATION("
-                f"{code_model.id}, "
-                f"{project.relocations.resolve(code_relocation).id})"
-            )
+        for model, relocation in project.code_model_relocations:
+            if model is code_model:
+                lines.append(f"BEDROCK_ELF_CODE_MODEL_RELOCATION({model.id}, {relocation.id})")
 
-    for tls_model in sorted(project.tls_models.values(), key=lambda item: item.id):
-        base = (
-            "NONE"
-            if tls_model.base_register is None
-            else workspace.resolve(tls_model.base_register).id
-        )
-        tls_protocol_id = (
-            "NONE"
-            if tls_model.protocol is None
-            else project.linkage_protocols.resolve(tls_model.protocol).id
-        )
+    tls_registers = {model.reference: register for model, register in project.tls_registers}
+    tls_protocols = {model.reference: protocol for model, protocol in project.tls_protocols}
+    for tls_model in sorted(project.tls_models, key=lambda item: item.id):
+        register = tls_registers.get(tls_model.reference)
+        protocol = tls_protocols.get(tls_model.reference)
+        base = "NONE" if register is None else register.id
+        protocol_id = "NONE" if protocol is None else protocol.id
+        properties = dict(project.properties[tls_model.reference])
         lines.append(
-            f"BEDROCK_ELF_TLS_MODEL({tls_model.id}, {base}, {tls_protocol_id}, "
-            f"{_c_string(str(tls_model.data['selection']))})"
+            f"BEDROCK_ELF_TLS_MODEL({tls_model.id}, {base}, {protocol_id}, "
+            f"{_c_string(str(properties[('selection',)]))})"
         )
-        for tls_relocation in tls_model.relocations:
-            lines.append(
-                f"BEDROCK_ELF_TLS_MODEL_RELOCATION("
-                f"{tls_model.id}, "
-                f"{project.relocations.resolve(tls_relocation).id})"
-            )
-        lines.extend(
-            _property_lines(
-                "BEDROCK_ELF_TLS_PROPERTY",
-                tls_model.id,
-                tls_model.data,
-                excluded={
-                    "id",
-                    "selection",
-                    "base_register",
-                    "protocol",
-                    "relocations",
-                },
-            )
-        )
+        for model, relocation in project.tls_relocations:
+            if model is tls_model:
+                lines.append(f"BEDROCK_ELF_TLS_MODEL_RELOCATION({model.id}, {relocation.id})")
+        lines.extend(_property_lines(
+            "BEDROCK_ELF_TLS_PROPERTY", tls_model.id,
+            tuple((path, value) for path, value in project.properties[tls_model.reference] if path != ("selection",)),
+        ))
 
     for assignment in sorted(
-        project.resolved_debug_registers(workspace), key=lambda item: item.first
+        project.debug_assignments, key=lambda item: item.first
     ):
         range_name = (
             f"RESERVED_{assignment.first}"
@@ -264,17 +224,17 @@ def _render_catalog(
         for offset, register in enumerate(assignment.registers):
             lines.append(
                 f"BEDROCK_ELF_DEBUG_REGISTER_MAPPING({range_name}, "
-                f"{assignment.first + offset}, {workspace.resolve(register).id})"
+                f"{assignment.first + offset}, {register.id})"
             )
 
     state = project.process_entry
     tls_base = (
-        "NONE" if state.tls_base is None else workspace.resolve(state.tls_base).id
+        "NONE" if state.tls_base is None else state.tls_base.id
     )
     lines.append(
         f"BEDROCK_ELF_ENTRY_STATE("
-        f"{workspace.resolve(state.entry_point).id}, "
-        f"{_c_string(state.entry_point_source)}, {workspace.resolve(state.stack).id}, "
+        f"{state.entry_point.id}, "
+        f"{_c_string(state.entry_point_source)}, {state.stack.id}, "
         f"{state.stack_alignment_bytes}, {tls_base}, "
         f"{_c_string(state.payload_owner)})"
     )
@@ -283,46 +243,29 @@ def _render_catalog(
     for role, register in state.segment_contexts.items():
         lines.append(
             f"BEDROCK_ELF_ENTRY_SEGMENT_CONTEXT({_token(role)}, "
-            f"{workspace.resolve(register).id})"
+            f"{register.id})"
         )
     for requirement in state.readiness:
         lines.append(f"BEDROCK_ELF_ENTRY_READINESS({_token(requirement)})")
     for register in state.cleared:
         lines.append(
-            f"BEDROCK_ELF_ENTRY_CLEARED_REGISTER({workspace.resolve(register).id})"
+            f"BEDROCK_ELF_ENTRY_CLEARED_REGISTER({register.id})"
         )
 
-    for linkage_protocol in sorted(
-        project.linkage_protocols.values(), key=lambda item: item.id
-    ):
-        lines.append(f"BEDROCK_ELF_LINKAGE_PROTOCOL({linkage_protocol.id})")
-        for index, step in enumerate(linkage_protocol.steps):
-            form = _c_string(step.form or "")
-            step_relocation = (
-                "NONE"
-                if step.relocation is None
-                else workspace.resolve(step.relocation).id
-            )
+    steps_by_protocol = {protocol.reference: steps for protocol, steps in project.linkage_steps}
+    for protocol in sorted(project.linkage_protocols, key=lambda item: item.id):
+        lines.append(f"BEDROCK_ELF_LINKAGE_PROTOCOL({protocol.id})")
+        for index, (instruction, form, relocation) in enumerate(steps_by_protocol[protocol.reference]):
+            relocation_id = "NONE" if relocation is None else relocation.id
             lines.append(
-                f"BEDROCK_ELF_LINKAGE_STEP({linkage_protocol.id}, {index}, "
-                f"{workspace.resolve(step.instruction).instruction.mnemonic}, "
-                f"{form}, {step_relocation})"
+                f"BEDROCK_ELF_LINKAGE_STEP({protocol.id}, {index}, "
+                f"{instruction.instruction.mnemonic}, {_c_string(form or '')}, {relocation_id})"
             )
-        for state_contract in linkage_protocol.state:
-            for state_register in state_contract.registers:
-                lines.append(
-                    f"BEDROCK_ELF_LINKAGE_REGISTER({linkage_protocol.id}, "
-                    f"{_token(state_contract.disposition)}, "
-                    f"{workspace.resolve(state_register).id})"
-                )
-        lines.extend(
-            _property_lines(
-                "BEDROCK_ELF_LINKAGE_PROPERTY",
-                linkage_protocol.id,
-                linkage_protocol.data,
-                excluded={"id", "steps", "state"},
-            )
-        )
+        for owner, disposition, registers in project.linkage_state:
+            if owner is protocol:
+                for register in registers:
+                    lines.append(f"BEDROCK_ELF_LINKAGE_REGISTER({protocol.id}, {_token(disposition)}, {register.id})")
+        lines.extend(_property_lines("BEDROCK_ELF_LINKAGE_PROPERTY", protocol.id, project.properties[protocol.reference]))
 
     lines.extend(_macro_cleanup())
     lines.append("")
@@ -342,12 +285,6 @@ def _lld_expression(relocation: Relocation) -> str:
             f"{relocation.source}: no LLVM/LLD expression mapping for "
             f"{relocation.calculation.code!r} ({signature})"
         ) from error
-
-
-def _field_id(workspace, reference) -> str:
-    """Return the authored field/payload type ID without exposing its ref key."""
-
-    return workspace.resolve(reference).id
 
 
 def _expression_signature(expression: RelocationExpression) -> str:
@@ -370,31 +307,11 @@ def _expression_signature(expression: RelocationExpression) -> str:
     return f"{expression.name}({operands})"
 
 
-def _property_lines(
-    macro: str,
-    owner: str,
-    data: Mapping[str, object],
-    *,
-    excluded: set[str],
-) -> list[str]:
-    lines: list[str] = []
-
-    def visit(path: tuple[str, ...], value: object) -> None:
-        if isinstance(value, Mapping):
-            for key in sorted(value):
-                visit((*path, str(key)), value[key])
-            return
-        if isinstance(value, list):
-            for index, item in enumerate(value):
-                visit((*path, str(index)), item)
-            return
-        key = _token("_".join(path))
-        lines.append(f"{macro}({owner}, {key}, {_scalar(value)})")
-
-    for key in sorted(data):
-        if key not in excluded:
-            visit((str(key),), data[key])
-    return lines
+def _property_lines(macro: str, owner: str, properties) -> list[str]:
+    return [
+        f"{macro}({owner}, {_token('_'.join(str(part) for part in path))}, {_scalar(value)})"
+        for path, value in properties
+    ]
 
 
 def _macro_defaults() -> list[str]:
@@ -446,7 +363,12 @@ def _scalar(value: object) -> str:
 
 
 def _c_string(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-__all__ = ["Generator"]
+    escaped = []
+    for character in value:
+        if character in ('\\', '"', '?'):
+            escaped.append('\\' + character)
+        elif ord(character) < 32 or ord(character) == 127:
+            escaped.append(f"\\{ord(character):03o}")
+        else:
+            escaped.append(character)
+    return '"' + ''.join(escaped) + '"'

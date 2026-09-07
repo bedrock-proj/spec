@@ -140,9 +140,9 @@ function repeat_observation_with_capture(
                     None() => after.flags,
                     Some(operand) => {
                         let local = if source then {
-                                local_operand_value(before, operand)
+                                local_operand_value(before, operand, instruction_ea_width(operand, operation_width(body)))
                             } else {
-                                local_operand_value(after, operand)
+                                local_operand_value(after, operand, instruction_ea_width(operand, operation_width(body)))
                             };
                         let value : bits(64) = match local {
                             Some(item) => item,

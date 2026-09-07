@@ -4,10 +4,7 @@ from pathlib import Path
 import yaml
 from jsonschema import Draft202012Validator
 
-from engine.encoding_metasyntax import (
-    EncodingMetasyntax,
-    EncodingMetasyntaxError,
-)
+from engine.syntax.encoding import EncodingMetasyntax, EncodingMetasyntaxError
 
 
 class EncodingMetasyntaxTest(unittest.TestCase):
@@ -32,25 +29,17 @@ class EncodingMetasyntaxTest(unittest.TestCase):
         self.assertTrue(pattern.matches(0b101101))
         self.assertFalse(pattern.matches(0b111101))
         self.assertTrue(
-            EncodingMetasyntax.parse("10aa").overlaps(
-                EncodingMetasyntax.parse("1b0b")
-            )
+            EncodingMetasyntax.parse("10aa").overlaps(EncodingMetasyntax.parse("1b0b"))
         )
         self.assertFalse(
-            EncodingMetasyntax.parse("10aa").overlaps(
-                EncodingMetasyntax.parse("11bb")
-            )
+            EncodingMetasyntax.parse("10aa").overlaps(EncodingMetasyntax.parse("11bb"))
         )
         self.assertFalse(
-            EncodingMetasyntax.parse("10aa").overlaps(
-                EncodingMetasyntax.parse("10aaa")
-            )
+            EncodingMetasyntax.parse("10aa").overlaps(EncodingMetasyntax.parse("10aaa"))
         )
 
     def test_extracts_non_contiguous_fields(self) -> None:
-        self.assertEqual(
-            EncodingMetasyntax.parse("a1a0").extract(0b0110, "a"), 0b01
-        )
+        self.assertEqual(EncodingMetasyntax.parse("a1a0").extract(0b0110, "a"), 0b01)
 
     def test_rejects_invalid_patterns_fields_and_values(self) -> None:
         with self.assertRaises(EncodingMetasyntaxError):
@@ -64,14 +53,13 @@ class EncodingMetasyntaxTest(unittest.TestCase):
         with self.assertRaises(EncodingMetasyntaxError):
             EncodingMetasyntax.parse("10aa").extract(0b1000, "b")
 
+
 class EncodingMetasyntaxSchemaTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         isa_root = Path(__file__).parents[1] / "isa"
         cls.schema = yaml.safe_load(
-            (isa_root / "schemas/encoding-metasyntax.yaml").read_text(
-                encoding="utf-8"
-            )
+            (isa_root / "schemas/encoding-metasyntax.yaml").read_text(encoding="utf-8")
         )
         Draft202012Validator.check_schema(cls.schema)
         cls.validator = Draft202012Validator(cls.schema)

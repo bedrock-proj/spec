@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from engine.diagnostics import (
+    render_diagnostics_json,
     Diagnostic,
     DiagnosticBag,
     RelatedLocation,
@@ -27,7 +28,7 @@ class DiagnosticBagTest(unittest.TestCase):
         self.assertFalse(DiagnosticBag().has_errors)
 
     def test_json_preserves_structured_location_and_relation(self) -> None:
-        rendered = json.loads(self.bag.render_json())
+        rendered = json.loads(render_diagnostics_json(self.bag))
         self.assertEqual(rendered[0]["severity"], Severity.ERROR.value)
         self.assertEqual(rendered[0]["code"], self.diagnostic.code)
         self.assertEqual(rendered[0]["path"], ["encodings", "left", "pattern"])

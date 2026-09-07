@@ -4,9 +4,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import cache
-from pathlib import Path
 from typing import Any
+from collections.abc import Mapping
 
 from engine.reference import Reference
 
@@ -21,7 +20,7 @@ from .project import (
 )
 
 if TYPE_CHECKING:
-    from engine.register import Register
+    from engine.isa.registers import Register
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,37 +44,69 @@ class Call:
     variadic: bool = False
     prototyped: bool = True
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "arguments", tuple(self.arguments))
+
+
+
 
 @dataclass(frozen=True, slots=True)
-class CallRules:
-    convention: ResolvedCallingConvention
-    register_classes_by_id: dict[str, ResolvedRegisterClass]
+class RegisterLocation:
+    registers: tuple[Register, ...]
 
-    @classmethod
-    def from_convention(cls, convention: ResolvedCallingConvention) -> "CallRules":
-        return cls(
-            convention,
-            {
-                item.definition.id: item
-                for item in convention.register_classes.values()
-            },
-        )
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "registers", tuple(self.registers))
 
-    @property
-    def value_classes(self) -> dict[str, ResolvedValueClass]:
-        return dict(self.convention.value_classes)
 
-    def value_class(self, kind: str) -> ResolvedValueClass:
-        try:
-            return self.convention.value_classes[kind]
-        except KeyError as error:
-            raise ValueError(f"unsupported call kind {kind!r}") from error
 
-    def register_class(self, reference: Reference[RegisterClass]) -> ResolvedRegisterClass:
-        try:
-            return self.convention.register_classes[reference]
-        except KeyError as error:
-            raise ValueError("calling convention omits a requested register class") from error
+@dataclass(frozen=True, slots=True)
+class StackLocation:
+    register: Register
+    offset_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class ArgumentAssignment:
+    argument: Argument
+    effective_kind: str
+    mode: str
+    location: RegisterLocation | StackLocation
+
+
+@dataclass(frozen=True, slots=True)
+class CallLayout:
+    sret: Register | None
+    return_location: RegisterLocation | None
+    arguments: tuple[ArgumentAssignment, ...]
+    stack_size: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "arguments", tuple(self.arguments))
+
+
+
+def check_call(call: Call, rules: ResolvedCallingConvention) -> None:
+    if not isinstance(call.variadic, bool) or not isinstance(call.prototyped, bool):
+        raise ValueError("variadic and prototyped must be boolean")
+    if call.variadic and not call.prototyped:
+        raise ValueError("a call cannot be both variadic and unprototyped")
+    unnamed = False
+    for argument in call.arguments:
+        if not isinstance(argument.name, str) or not argument.name:
+            raise ValueError("argument name must be nonempty")
+        rules.value_class(argument.kind)
+        _positive_aggregate_size(argument.kind, argument.size, argument.name)
+        if not isinstance(argument.named, bool):
+            raise ValueError(f"argument {argument.name}: named must be boolean")
+        if argument.named and unnamed:
+            raise ValueError("named arguments must precede variadic arguments")
+        if not argument.named:
+            if not call.variadic:
+                raise ValueError("unnamed arguments require a variadic call")
+            unnamed = True
+    if call.return_value.kind != "void":
+        rules.value_class(call.return_value.kind)
+    _positive_aggregate_size(call.return_value.kind, call.return_value.size, "return value")
 
 
 def _positive_aggregate_size(kind: str, size: int | None, context: str) -> None:
@@ -86,12 +117,14 @@ def _positive_aggregate_size(kind: str, size: int | None, context: str) -> None:
         raise ValueError(f"{context}: size is valid only for aggregate values")
 
 
-def _argument(data: dict[str, Any], index: int, rules: CallRules) -> Argument:
+def _argument(data: dict[str, Any], index: int, rules: ResolvedCallingConvention) -> Argument:
+    if not isinstance(data, Mapping):
+        raise ValueError(f"argument {index}: expected an object")
     name = data.get("name")
     kind = data.get("kind")
     if not isinstance(name, str) or not name:
         raise ValueError(f"argument {index}: name must be a nonempty string")
-    if not isinstance(kind, str) or kind not in rules.convention.value_classes:
+    if not isinstance(kind, str) or kind not in rules.value_classes:
         raise ValueError(f"argument {name}: unsupported kind {kind!r}")
     named = data.get("named", True)
     if not isinstance(named, bool):
@@ -101,10 +134,10 @@ def _argument(data: dict[str, Any], index: int, rules: CallRules) -> Argument:
     return Argument(name=name, kind=kind, named=named, size=size)
 
 
-def _return_value(data: dict[str, Any], rules: CallRules) -> ReturnValue:
+def _return_value(data: dict[str, Any], rules: ResolvedCallingConvention) -> ReturnValue:
     kind = data.get("kind")
     if kind != "void" and (
-        not isinstance(kind, str) or kind not in rules.convention.value_classes
+        not isinstance(kind, str) or kind not in rules.value_classes
     ):
         raise ValueError(f"return value: unsupported kind {kind!r}")
     size = data.get("size")
@@ -112,8 +145,9 @@ def _return_value(data: dict[str, Any], rules: CallRules) -> ReturnValue:
     return ReturnValue(kind=kind, size=size)
 
 
-def parse_call(data: dict[str, Any], rules: CallRules | None = None) -> Call:
-    rules = rules or default_rules()
+def parse_call(data: dict[str, Any], rules: ResolvedCallingConvention) -> Call:
+    if not isinstance(data, Mapping):
+        raise ValueError("call must be an object")
     arguments_data = data.get("arguments", [])
     if not isinstance(arguments_data, list):
         raise ValueError("call arguments must be a list")
@@ -138,15 +172,17 @@ def parse_call(data: dict[str, Any], rules: CallRules | None = None) -> Call:
                 raise ValueError("named arguments must precede variadic arguments")
         else:
             seen_unnamed = True
-    return Call(
+    call = Call(
         arguments=arguments,
         return_value=_return_value(return_data, rules),
         variadic=variadic,
         prototyped=prototyped,
     )
+    check_call(call, rules)
+    return call
 
 
-def _uses_sret(value: ReturnValue, rules: CallRules) -> bool:
+def _uses_sret(value: ReturnValue, rules: ResolvedCallingConvention) -> bool:
     if value.kind == "void":
         return False
     policy = rules.value_class(value.kind).definition.result
@@ -159,55 +195,44 @@ def _uses_sret(value: ReturnValue, rules: CallRules) -> bool:
     return False
 
 
-def _register_name(register: Register) -> str:
-    return register.id
 
 
-def _format_registers(registers: tuple[Register, ...], kind: str) -> str:
-    names = tuple(_register_name(register) for register in registers)
-    if len(names) == 1:
-        return names[0]
-    if kind.startswith("complex_"):
-        return f"{names[0]}(real)+{names[1]}(imag)"
-    return ":".join(reversed(names))
 
 
 def return_location(
-    value: ReturnValue, rules: CallRules | None = None
-) -> str | None:
-    """Project a result value to its canonical register spelling."""
+    value: ReturnValue, rules: ResolvedCallingConvention
+) -> RegisterLocation | None:
+    """Return the canonical result registers selected by the ABI policy."""
 
-    rules = rules or default_rules()
+    _positive_aggregate_size(value.kind, value.size, "return value")
     if value.kind == "void":
         return None
     if _uses_sret(value, rules):
-        return _register_name(rules.convention.sret_register)
+        return RegisterLocation((rules.sret_register,))
     value_class = rules.value_class(value.kind)
-    policy = value_class.definition.result
-    register_class = value_class.result_register_class
-    if register_class is None or policy.units is None:
-        raise ValueError(f"result kind {value.kind!r} has no direct location")
-    return _format_registers(register_class.results[: policy.units], value.kind)
+    return RegisterLocation(value_class.result_registers)
 
 
-def layout_call(call: Call, rules: CallRules | None = None) -> dict[str, Any]:
+def layout_call(call: Call, rules: ResolvedCallingConvention) -> CallLayout:
     """Project one call signature through the resolved calling convention."""
 
-    rules = rules or default_rules()
-    stack = rules.convention.definition.stack
+    check_call(call, rules)
+    stack = rules.definition.stack
     uses_sret = _uses_sret(call.return_value, rules)
-    cursors = {reference: 0 for reference in rules.convention.register_classes}
+    cursors = {reference: 0 for reference in rules.register_classes}
     exhausted: set[Reference[RegisterClass]] = set()
-    general = rules.register_classes_by_id["GENERAL"]
-    general_reference = general.definition.reference
+    general = next(
+        item for item in rules.register_classes.values()
+        if rules.sret_register in item.arguments
+    )
     if uses_sret:
-        cursors[general_reference] = 1
+        cursors[general.definition.reference] = 1
     next_stack_offset = stack.first_argument_offset_bytes
-    assignments: list[dict[str, Any]] = []
+    assignments: list[ArgumentAssignment] = []
 
-    def stack_location() -> str:
+    def stack_location() -> StackLocation:
         nonlocal next_stack_offset
-        location = f"[SP+{next_stack_offset}]"
+        location = StackLocation(rules.stack_pointer, next_stack_offset)
         next_stack_offset += stack.argument_slot_bytes
         return location
 
@@ -217,7 +242,7 @@ def layout_call(call: Call, rules: CallRules | None = None) -> dict[str, Any]:
         units: int,
         alignment: int,
         kind: str,
-    ) -> str | None:
+    ) -> RegisterLocation | None:
         reference = register_class.definition.reference
         cursor = cursors[reference]
         aligned = ((cursor + alignment - 1) // alignment) * alignment
@@ -228,28 +253,26 @@ def layout_call(call: Call, rules: CallRules | None = None) -> dict[str, Any]:
             return None
         selected = register_class.arguments[aligned : aligned + units]
         cursors[reference] = aligned + units
-        return _format_registers(selected, kind)
+        return RegisterLocation(selected)
 
     for argument in call.arguments:
         force_stack = (not call.prototyped) or (call.variadic and not argument.named)
         effective_kind = (
-            rules.convention.promotions.get(argument.kind, argument.kind)
+            rules.promotions.get(argument.kind, argument.kind)
             if force_stack
             else argument.kind
         )
         value_class = rules.value_class(effective_kind)
         policy = value_class.definition.argument
-        mode = "copy-address" if policy.mode == "copy_address" else "value"
-        location: str | None
+        mode = policy.mode
+        location: RegisterLocation | StackLocation | None
 
         if force_stack:
             if policy.mode == "copy_address" or effective_kind in {"vector", "predicate"}:
-                mode = "copy-address"
+                mode = "copy_address"
             location = stack_location()
         else:
             register_class = value_class.argument_register_class
-            if register_class is None or policy.units is None:
-                raise ValueError(f"argument kind {effective_kind!r} has no location policy")
             location = assign_registers(
                 register_class,
                 units=policy.units,
@@ -260,7 +283,7 @@ def layout_call(call: Call, rules: CallRules | None = None) -> dict[str, Any]:
                 location is None
                 and register_class.definition.exhaustion == "indirect"
             ):
-                mode = "copy-address"
+                mode = "copy_address"
                 location = assign_registers(
                     general, units=1, alignment=1, kind="pointer"
                 )
@@ -269,34 +292,10 @@ def layout_call(call: Call, rules: CallRules | None = None) -> dict[str, Any]:
 
         assert location is not None
 
-        assignments.append(
-            {
-                "name": argument.name,
-                "source_kind": argument.kind,
-                "effective_kind": effective_kind,
-                "mode": mode,
-                "location": location,
-            }
-        )
+        assignments.append(ArgumentAssignment(argument, effective_kind, mode, location))
 
-    return {
-        "sret": _register_name(rules.convention.sret_register) if uses_sret else None,
-        "return_location": return_location(call.return_value, rules),
-        "arguments": assignments,
-        "stack_size": next_stack_offset - stack.first_argument_offset_bytes,
-    }
-
-
-@cache
-def default_rules() -> CallRules:
-    """Load the repository's default C calling convention and its ISA objects."""
-
-    from engine.workspace import SpecWorkspace
-
-    repository = Path(__file__).resolve().parents[3]
-    workspace = SpecWorkspace.load(repository)
-    project = workspace.require_provider("abi.c")
-    if not isinstance(project, CAbiProject):
-        raise TypeError("abi.c provider must be a CAbiProject")
-    resolved = project.resolved_calling_convention(workspace)
-    return CallRules.from_convention(resolved)
+    return CallLayout(
+        rules.sret_register if uses_sret else None,
+        return_location(call.return_value, rules), tuple(assignments),
+        next_stack_offset - stack.first_argument_offset_bytes,
+    )

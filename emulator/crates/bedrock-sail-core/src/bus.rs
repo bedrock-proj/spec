@@ -1,5 +1,6 @@
 use super::{
     SailCore, SailCoreFault, SailCoreRequest, SailCoreResponse, SailCoreStatus,
+    SailCoreValidationRange,
     protocol::{request_kind, request_role, response_kind, transaction_access},
 };
 use crate::translation::{
@@ -71,7 +72,7 @@ struct RequestTranslation {
     access: TranslationAccess,
     user_domain: bool,
     supervisor: bool,
-    first_linear_address: u64,
+    monitoring_enabled: bool,
     first: TranslationResult,
 }
 
@@ -87,12 +88,13 @@ struct PreparedMemoryRange {
     physical_address: u64,
     buffer_offset: usize,
     length: usize,
+    fault_range: SailCoreValidationRange,
 }
 
 #[derive(Debug)]
 enum PrepareMemoryRangesError {
     Invalid(BusError),
-    Fault(TranslationFault),
+    Fault(TranslationFault, u64),
     Bus(BusError),
 }
 
@@ -170,8 +172,16 @@ impl SailCore {
                     status = self.resume(response);
                 }
                 SailCoreStatus::Fault => {
+                    let fault = self.last_fault().map_err(SailBusExecutionError::Core)?;
+                    if fault.address_valid != 0 {
+                        if let Some(request) = active_request.as_mut() {
+                            request.effective_address = fault.effective_address;
+                            request.linear_address = fault.linear_address;
+                            request.width = fault.width;
+                        }
+                    }
                     return Err(SailBusExecutionError::Fault {
-                        fault: self.last_fault().map_err(SailBusExecutionError::Core)?,
+                        fault,
                         request: active_request,
                     });
                 }
@@ -192,24 +202,27 @@ fn fetch_virtual_instruction(
 ) -> Result<Vec<u8>, SailBusExecutionError> {
     let state = core.state().map_err(SailBusExecutionError::Core)?;
     let ptcr = state.controls.base_ptcr;
+    let monitoring_enabled = state.controls.base_pmc & 1 != 0;
+    let mut latest_mapping: Option<TranslationResult> = None;
     fetch_instruction_with(pc, |effective| {
         let linear = translation::segment_linear(state.segments[0], effective)
             .map_err(|fault| fetch_translation_fault(fault, effective, effective))?;
-        if ptcr & 1 != 0 {
-            core.environment.page_walk_counter = core.environment.page_walk_counter.wrapping_add(1);
-        }
-        let translated = translation::translate(
-            bus,
-            linear,
-            ptcr,
-            TranslationAccess::Execute,
-            false,
-            state.supervisor != 0,
-        )
-        .map_err(|error| match error {
-            TranslationError::Fault(fault) => fetch_translation_fault(fault, effective, linear),
-            TranslationError::Bus(error) => SailBusExecutionError::Bus(error),
-        })?;
+        let translated = match latest_mapping
+            .and_then(|previous| previous.within_mapping(bus, linear))
+        {
+            Some(translated) => translated,
+            None => {
+                translation::translate(
+                    bus, linear, ptcr, TranslationAccess::Execute, false,
+                    state.supervisor != 0,
+                    || core.environment.page_walk_started(monitoring_enabled),
+                ).map_err(|error| match error {
+                    TranslationError::Fault(fault) => fetch_translation_fault(fault, effective, linear),
+                    TranslationError::Bus(error) => SailBusExecutionError::Bus(error),
+                })?
+            }
+        };
+        latest_mapping = Some(translated);
         if translated.access_class != 0 {
             return Err(fetch_translation_fault(
                 translation::TranslationFault {
@@ -379,7 +392,65 @@ fn service_request(
         return Ok(response);
     }
 
+    response.fault_range = Some(request_fault_range(request, request.linear_address));
+    let data_ranges = if request.kind == request_kind::READ
+        && request.access != transaction_access::ADDRESS_ONLY
+    {
+        let length = match usize::try_from(request.body_length) {
+            Ok(length) => length,
+            Err(_) => {
+                set_access_failure(&mut response, invalid_request_range(request.linear_address));
+                return Ok(response);
+            }
+        };
+        Some(logical_memory_ranges(request, length, true))
+    } else if request.kind == request_kind::WRITE {
+        Some(logical_memory_ranges(request, request.payload.len(), false))
+    } else {
+        None
+    };
+    let data_ranges = match data_ranges {
+        Some(Ok(ranges)) => Some(ranges),
+        Some(Err(error)) => {
+            set_access_failure(&mut response, error);
+            return Ok(response);
+        }
+        None => None,
+    };
+    let validation_ranges = match data_ranges.as_ref() {
+        Some(ranges) => match logical_validation_ranges(request, ranges) {
+            Ok(ranges) => Some(ranges),
+            Err(error) => {
+                set_access_failure(&mut response, error);
+                return Ok(response);
+            }
+        },
+        None => None,
+    };
+    if validation_ranges.as_ref().is_some_and(Vec::is_empty) {
+        let result = if request.kind == request_kind::READ {
+            service_read(bus, request.linear_address, request, &mut response, &[])
+        } else {
+            service_write(bus, request.linear_address, request, &mut response, &[])
+        };
+        if let Err(error) = result {
+            set_access_failure(&mut response, error);
+        }
+        if request.debug_validation {
+            response.body.clear();
+        }
+        if response.success {
+            response.fault_range = None;
+        }
+        return Ok(response);
+    }
+    let first_linear_address = validation_ranges
+        .as_ref()
+        .and_then(|ranges| ranges.iter().map(|range| range.linear_address).min())
+        .unwrap_or(request.linear_address);
+
     let mut request_translation = None;
+    response.fault_range = Some(request_fault_range(request, first_linear_address));
     let address = if request.debug_validated {
         let physical_class = match bus.physical_memory_class(request.physical_address) {
             PhysicalMemoryClass::Normal => 0,
@@ -391,9 +462,7 @@ fn service_request(
         request.physical_address
     } else if request.address_translation {
         let ptcr = core.control(0).map_err(SailBusExecutionError::Core)?;
-        if ptcr & 1 != 0 {
-            core.environment.page_walk_counter = core.environment.page_walk_counter.wrapping_add(1);
-        }
+        let monitoring_enabled = core.control(0x1100).map_err(SailBusExecutionError::Core)? & 1 != 0;
         let access = match request.access {
             transaction_access::STORE
             | transaction_access::READ_MODIFY_WRITE
@@ -409,11 +478,12 @@ fn service_request(
         };
         match translation::translate(
             bus,
-            request.linear_address,
+            first_linear_address,
             ptcr,
             access,
             request.domain == 1,
             supervisor,
+            || core.environment.page_walk_started(monitoring_enabled),
         ) {
             Ok(translated) => {
                 response.access_class = translated.access_class;
@@ -425,7 +495,7 @@ fn service_request(
                     access,
                     user_domain: request.domain == 1,
                     supervisor,
-                    first_linear_address: request.linear_address,
+                    monitoring_enabled,
                     first: translated,
                 });
             }
@@ -442,11 +512,12 @@ fn service_request(
     } else {
         match translation::translate(
             bus,
-            request.linear_address,
+            first_linear_address,
             0,
             TranslationAccess::Read,
             false,
             true,
+            || {},
         ) {
             Ok(translated) => {
                 response.access_class = translated.access_class;
@@ -461,57 +532,22 @@ fn service_request(
             }
             Err(TranslationError::Bus(error)) => return Err(error.into()),
         }
-        request.linear_address
+        first_linear_address
     };
 
-    let prepared_ranges = if request.kind == request_kind::READ
-        && request.access != transaction_access::ADDRESS_ONLY
-    {
-        let body_length = match usize::try_from(request.body_length) {
-            Ok(length) => length,
-            Err(_) => {
-                set_access_failure(&mut response, invalid_request_range(address));
-                return Ok(response);
-            }
-        };
-        let logical = match logical_memory_ranges(request, body_length, true) {
-            Ok(ranges) => ranges,
-            Err(error) => {
-                set_access_failure(&mut response, error);
-                return Ok(response);
-            }
-        };
-        match prepare_memory_ranges(core, bus, request, address, request_translation, &logical) {
+    let prepared_ranges = if let Some(logical) = data_ranges {
+        match prepare_memory_ranges(
+            core, bus, request, address, request_translation, &logical,
+            validation_ranges.as_deref().unwrap_or(&[]),
+        ) {
             Ok(ranges) => Some(ranges),
             Err(PrepareMemoryRangesError::Invalid(error)) => {
                 set_access_failure(&mut response, error);
                 return Ok(response);
             }
-            Err(PrepareMemoryRangesError::Fault(fault)) => {
+            Err(PrepareMemoryRangesError::Fault(fault, linear_address)) => {
                 response.success = false;
-                response.fault_kind = fault.kind;
-                response.fault_cause = fault.cause;
-                response.detail = fault.detail;
-                return Ok(response);
-            }
-            Err(PrepareMemoryRangesError::Bus(error)) => return Err(error.into()),
-        }
-    } else if request.kind == request_kind::WRITE {
-        let logical = match logical_memory_ranges(request, request.payload.len(), false) {
-            Ok(ranges) => ranges,
-            Err(error) => {
-                set_access_failure(&mut response, error);
-                return Ok(response);
-            }
-        };
-        match prepare_memory_ranges(core, bus, request, address, request_translation, &logical) {
-            Ok(ranges) => Some(ranges),
-            Err(PrepareMemoryRangesError::Invalid(error)) => {
-                set_access_failure(&mut response, error);
-                return Ok(response);
-            }
-            Err(PrepareMemoryRangesError::Fault(fault)) => {
-                response.success = false;
+                response.fault_range = Some(request_fault_range(request, linear_address));
                 response.fault_kind = fault.kind;
                 response.fault_cause = fault.cause;
                 response.detail = fault.detail;
@@ -525,6 +561,7 @@ fn service_request(
 
     if request.debug_validation {
         response.value = address;
+        response.fault_range = None;
         return Ok(response);
     }
 
@@ -549,6 +586,7 @@ fn service_request(
                 bus,
                 address,
                 request,
+                &mut response,
                 prepared_ranges.as_deref().unwrap_or(&[]),
             );
             if result.is_ok() && request.selector == 1 {
@@ -582,6 +620,9 @@ fn service_request(
     };
     if let Err(error) = operation {
         set_access_failure(&mut response, error);
+    }
+    if response.success {
+        response.fault_range = None;
     }
     Ok(response)
 }
@@ -637,6 +678,7 @@ fn service_read(
         usize::try_from(request.body_length).map_err(|_| invalid_request_range(address))?;
     let mut body = vec![0; length];
     for range in ranges {
+        response.fault_range = Some(range.fault_range);
         for index in 0..range.length {
             let current =
                 range
@@ -656,6 +698,7 @@ fn service_write(
     bus: &mut impl Bus,
     address: u64,
     request: &SailCoreRequest,
+    response: &mut SailCoreResponse,
     ranges: &[PreparedMemoryRange],
 ) -> Result<(), BusError> {
     if request.access != transaction_access::STORE
@@ -664,6 +707,7 @@ fn service_write(
         return Err(invalid_request_range(address));
     }
     for range in ranges {
+        response.fault_range = Some(range.fault_range);
         let end = range
             .buffer_offset
             .checked_add(range.length)
@@ -728,6 +772,49 @@ fn logical_memory_ranges(
     Ok(result)
 }
 
+fn logical_validation_ranges(
+    request: &SailCoreRequest,
+    accesses: &[LogicalMemoryRange],
+) -> Result<Vec<SailCoreValidationRange>, BusError> {
+    let envelope_end = if request.debug_validated {
+        None
+    } else {
+        Some(linear_range_end(request)?)
+    };
+    let mut ranges = Vec::new();
+    for range in &request.validation_ranges {
+        let width = u128::try_from(range.width)
+            .map_err(|_| invalid_request_range(range.linear_address))?;
+        if width == 0 {
+            continue;
+        }
+        if range.linear_address < request.linear_address
+            || envelope_end.is_some_and(|end| u128::from(range.linear_address) + width > end)
+        {
+            return Err(invalid_request_range(range.linear_address));
+        }
+        ranges.push(*range);
+    }
+    ranges.sort_by_key(|range| range.linear_address);
+    for access in accesses {
+        let end = u128::from(access.linear_address) + access.length as u128;
+        let mut covered = u128::from(access.linear_address);
+        for range in &ranges {
+            if covered >= end {
+                break;
+            }
+            if u128::from(range.linear_address) > covered {
+                break;
+            }
+            covered = covered.max(u128::from(range.linear_address) + range.width as u128);
+        }
+        if covered < end {
+            return Err(invalid_request_range(access.linear_address));
+        }
+    }
+    Ok(ranges)
+}
+
 fn prepare_memory_ranges(
     core: &mut SailCore,
     bus: &mut impl Bus,
@@ -735,13 +822,19 @@ fn prepare_memory_ranges(
     address: u64,
     translation: Option<RequestTranslation>,
     ranges: &[LogicalMemoryRange],
+    validation_ranges: &[SailCoreValidationRange],
 ) -> Result<Vec<PreparedMemoryRange>, PrepareMemoryRangesError> {
     let Some(translation) = translation else {
+        let first_linear_address = validation_ranges
+            .iter()
+            .map(|range| range.linear_address)
+            .min()
+            .unwrap_or(request.linear_address);
         return ranges
             .iter()
             .map(|range| {
                 let physical_address =
-                    memory_range_address(address, request.linear_address, range.linear_address)?;
+                    memory_range_address(address, first_linear_address, range.linear_address)?;
                 physical_address
                     .checked_add((range.length - 1) as u64)
                     .ok_or(BusError::OutOfRange {
@@ -751,6 +844,7 @@ fn prepare_memory_ranges(
                     physical_address,
                     buffer_offset: range.buffer_offset,
                     length: range.length,
+                    fault_range: request_fault_range(request, range.linear_address),
                 })
             })
             .collect::<Result<Vec<_>, BusError>>()
@@ -758,39 +852,33 @@ fn prepare_memory_ranges(
     };
 
     let page_mask = MIN_PAGE_BYTES - 1;
-    let first_page = translation.first_linear_address & !page_mask;
-    let first_page_offset = translation.first_linear_address & page_mask;
-    let mut first_page_translation = translation.first;
-    first_page_translation.address = first_page_translation
-        .address
-        .checked_sub(first_page_offset)
-        .ok_or_else(|| PrepareMemoryRangesError::Invalid(invalid_request_range(address)))?;
-    let mut translated_pages = BTreeMap::from([(first_page, first_page_translation)]);
-    let validation_end = linear_range_end(request).map_err(PrepareMemoryRangesError::Invalid)?;
-    let mut validation_cursor = u128::from(request.linear_address);
-    while validation_cursor < validation_end {
-        let validation_address = u64::try_from(validation_cursor).map_err(|_| {
-            PrepareMemoryRangesError::Invalid(invalid_request_range(request.linear_address))
-        })?;
-        let page = validation_address & !page_mask;
-        let page_offset = validation_address & page_mask;
-        let page_remaining = (MIN_PAGE_BYTES - page_offset) as usize;
-        let length =
-            usize::try_from((validation_end - validation_cursor).min(page_remaining as u128))
-                .map_err(|_| {
-                    PrepareMemoryRangesError::Invalid(invalid_request_range(request.linear_address))
-                })?;
-        if let std::collections::btree_map::Entry::Vacant(entry) = translated_pages.entry(page) {
-            entry.insert(translate_page(
-                core,
-                bus,
-                translation,
-                validation_address,
-                page_offset,
-                address,
-            )?);
+    let first_page = translation.first.linear_address & !page_mask;
+    let mut latest_mapping = translation.first;
+    let mut translated_pages = BTreeMap::from([(first_page, latest_mapping)]);
+    let mut active_pages = BTreeMap::new();
+    for range in validation_ranges {
+        let end = u128::from(range.linear_address) + range.width as u128;
+        let mut cursor = u128::from(range.linear_address);
+        while cursor < end {
+            let linear = u64::try_from(cursor).map_err(|_| {
+                PrepareMemoryRangesError::Invalid(invalid_request_range(range.linear_address))
+            })?;
+            let page = linear & !page_mask;
+            active_pages
+                .entry(page)
+                .and_modify(|first: &mut u64| *first = (*first).min(linear))
+                .or_insert(linear);
+            cursor = end.min(u128::from(page) + u128::from(MIN_PAGE_BYTES));
         }
-        validation_cursor += length as u128;
+    }
+    for (page, validation_address) in active_pages {
+        if let std::collections::btree_map::Entry::Vacant(entry) = translated_pages.entry(page) {
+            latest_mapping = match latest_mapping.within_mapping(bus, validation_address) {
+                Some(translated) => translated,
+                None => translate_page(core, bus, translation, validation_address)?,
+            };
+            entry.insert(latest_mapping);
+        }
     }
     validate_translated_pages(request, &translated_pages)?;
 
@@ -807,12 +895,14 @@ fn prepare_memory_ranges(
             let page_offset = linear_address & page_mask;
             let page_remaining = (MIN_PAGE_BYTES - page_offset) as usize;
             let length = remaining.min(page_remaining);
-            let physical_page = translated_pages
+            let translated = translated_pages
                 .get(&page)
                 .ok_or_else(|| {
                     PrepareMemoryRangesError::Invalid(invalid_request_range(request.linear_address))
-                })?
-                .address;
+                })?;
+            let physical_page = translated.address
+                .checked_sub(translated.linear_address & page_mask)
+                .ok_or_else(|| PrepareMemoryRangesError::Invalid(invalid_request_range(linear_address)))?;
             let physical_address = physical_page.checked_add(page_offset).ok_or_else(|| {
                 PrepareMemoryRangesError::Invalid(BusError::OutOfRange {
                     addr: physical_page,
@@ -829,6 +919,7 @@ fn prepare_memory_ranges(
                 physical_address,
                 buffer_offset,
                 length,
+                fault_range: request_fault_range(request, range.linear_address),
             });
             linear_cursor += length as u128;
             buffer_offset = buffer_offset
@@ -845,12 +936,7 @@ fn translate_page(
     bus: &mut impl Bus,
     translation: RequestTranslation,
     linear_address: u64,
-    page_offset: u64,
-    request_address: u64,
 ) -> Result<TranslationResult, PrepareMemoryRangesError> {
-    if translation.ptcr & 1 != 0 {
-        core.environment.page_walk_counter = core.environment.page_walk_counter.wrapping_add(1);
-    }
     let translated = match translation::translate(
         bus,
         linear_address,
@@ -858,39 +944,60 @@ fn translate_page(
         translation.access,
         translation.user_domain,
         translation.supervisor,
+        || core.environment.page_walk_started(translation.monitoring_enabled),
     ) {
         Ok(translated) => translated,
         Err(TranslationError::Fault(fault)) => {
-            return Err(PrepareMemoryRangesError::Fault(fault));
+            return Err(PrepareMemoryRangesError::Fault(fault, linear_address));
         }
         Err(TranslationError::Bus(error)) => {
             return Err(PrepareMemoryRangesError::Bus(error));
         }
     };
-    let mut translated = translated;
-    translated.address = translated
-        .address
-        .checked_sub(page_offset)
-        .ok_or_else(|| PrepareMemoryRangesError::Invalid(invalid_request_range(request_address)))?;
     Ok(translated)
+}
+
+fn request_fault_range(request: &SailCoreRequest, linear: u64) -> SailCoreValidationRange {
+    request.validation_ranges.iter().copied().find(|range| {
+        range.width > 0
+            && range.linear_address <= linear
+            && u128::from(linear) < u128::from(range.linear_address) + range.width as u128
+    }).unwrap_or(SailCoreValidationRange {
+        effective_address: request.effective_address,
+        linear_address: request.linear_address,
+        width: request.width,
+    })
+}
+
+fn validation_address_on_page(
+    request: &SailCoreRequest, page: u64,
+) -> Result<u64, PrepareMemoryRangesError> {
+    request.validation_ranges.iter().filter(|range| {
+        range.width > 0
+            && u128::from(range.linear_address) < u128::from(page) + u128::from(MIN_PAGE_BYTES)
+            && u128::from(page) < u128::from(range.linear_address) + range.width as u128
+    }).map(|range| range.linear_address.max(page)).min()
+        .ok_or_else(|| PrepareMemoryRangesError::Invalid(invalid_request_range(page)))
 }
 
 fn validate_translated_pages(
     request: &SailCoreRequest,
     translated_pages: &BTreeMap<u64, TranslationResult>,
 ) -> Result<(), PrepareMemoryRangesError> {
-    let mut has_mmio = false;
-    for translated in translated_pages.values() {
+    let mut first_mmio = None;
+    for (page, translated) in translated_pages {
         if translated.access_class == 0 && translated.physical_class != 0 {
             return Err(PrepareMemoryRangesError::Fault(TranslationFault {
                 kind: translation::FAULT_TRANSLATION,
                 cause: 6,
                 detail: "Normal access class selected Device physical memory".to_owned(),
-            }));
+            }, validation_address_on_page(request, *page)?));
         }
-        has_mmio |= translated.access_class != 0;
+        if translated.access_class != 0 && first_mmio.is_none() {
+            first_mmio = Some(validation_address_on_page(request, *page)?);
+        }
     }
-    if has_mmio && !request.suppress_fault {
+    if let Some(mmio_address) = first_mmio.filter(|_| !request.suppress_fault) {
         let scalar = matches!(request.kind, request_kind::READ | request_kind::WRITE)
             && request.range_length == request.width
             && request.selector == 0
@@ -900,14 +1007,14 @@ fn validate_translated_pages(
                 kind: translation::FAULT_ACCESS,
                 cause: 2,
                 detail: "operation is not permitted for MMIO".to_owned(),
-            }));
+            }, mmio_address));
         }
         if request.linear_address % request.width as u64 != 0 {
             return Err(PrepareMemoryRangesError::Fault(TranslationFault {
                 kind: translation::FAULT_ACCESS,
                 cause: 1,
                 detail: "MMIO scalar is not naturally aligned".to_owned(),
-            }));
+            }, request.linear_address));
         }
     }
     Ok(())
@@ -1139,6 +1246,12 @@ mod tests {
                 linear_address: 0x40,
                 address_translation: true,
                 debug_validation: true,
+                range_length: 8,
+                validation_ranges: vec![crate::SailCoreValidationRange {
+                    effective_address: 0x40,
+                    linear_address: 0x40,
+                    width: 8,
+                }],
                 ..SailCoreRequest::default()
             };
 
@@ -1179,6 +1292,11 @@ mod tests {
                 width: 8,
                 buffer_offset: 0,
             }],
+            validation_ranges: vec![crate::SailCoreValidationRange {
+                effective_address: 0x3ff8,
+                linear_address: 0x3ff8,
+                width: 16,
+            }],
             ..SailCoreRequest::default()
         };
 
@@ -1206,6 +1324,12 @@ mod tests {
                 linear_address: u64::MAX,
                 width: 8,
                 buffer_offset: 0,
+            }],
+            range_length: 8,
+            validation_ranges: vec![crate::SailCoreValidationRange {
+                effective_address: 0,
+                linear_address: u64::MAX,
+                width: 8,
             }],
             ..SailCoreRequest::default()
         };
@@ -1282,6 +1406,7 @@ mod tests {
         ram.write_u64(0xc010, 0x1_0000 | LEAF_RW).unwrap();
         let mut state = core.state().unwrap();
         state.controls.base_ptcr = 0x4005;
+        state.controls.base_pmc = 1;
         state.status |= 1 << 4;
         state.supervisor = 1;
         state.sp = 0x8008;
@@ -1330,6 +1455,11 @@ mod tests {
                 width: 16,
                 buffer_offset: 0,
             }],
+            validation_ranges: vec![crate::SailCoreValidationRange {
+                effective_address: 0x3ff8,
+                linear_address: 0x3ff8,
+                width: 16,
+            }],
             ..SailCoreRequest::default()
         };
 
@@ -1376,6 +1506,11 @@ mod tests {
                 width: 16,
                 buffer_offset: 0,
             }],
+            validation_ranges: vec![crate::SailCoreValidationRange {
+                effective_address: 0x3ff8,
+                linear_address: 0x3ff8,
+                width: 16,
+            }],
             ..SailCoreRequest::default()
         };
 
@@ -1416,6 +1551,11 @@ mod tests {
                 linear_address: 0x3ff8,
                 width: 8,
                 buffer_offset: 0,
+            }],
+            validation_ranges: vec![crate::SailCoreValidationRange {
+                effective_address: 0x3ff8,
+                linear_address: 0x3ff8,
+                width: 16,
             }],
             ..SailCoreRequest::default()
         };
@@ -1460,6 +1600,11 @@ mod tests {
                 width: 16,
                 buffer_offset: 0,
             }],
+            validation_ranges: vec![crate::SailCoreValidationRange {
+                effective_address: 0x3ff8,
+                linear_address: 0x3ff8,
+                width: 16,
+            }],
             ..SailCoreRequest::default()
         };
 
@@ -1491,6 +1636,11 @@ mod tests {
                 width: 8,
                 buffer_offset: 0,
             }],
+            validation_ranges: vec![crate::SailCoreValidationRange {
+                effective_address: u64::MAX - 7,
+                linear_address: u64::MAX - 7,
+                width: 8,
+            }],
             ..SailCoreRequest::default()
         };
         let logical = super::logical_memory_ranges(&request, 8, true).unwrap();
@@ -1504,15 +1654,18 @@ mod tests {
                 access: crate::translation::TranslationAccess::Read,
                 user_domain: false,
                 supervisor: true,
-                first_linear_address: u64::MAX - 7,
+                monitoring_enabled: false,
                 first: crate::translation::TranslationResult {
+                    linear_address: u64::MAX - 7,
                     address: 0x3ff8,
+                    leaf_mask: Some(crate::translation::MIN_PAGE_BYTES - 1),
                     access_class: 0,
                     physical_class: 0,
                     cache_policy: 0,
                 },
             }),
             &logical,
+            &request.validation_ranges,
         )
         .unwrap();
 
@@ -1522,6 +1675,7 @@ mod tests {
                 physical_address: 0x3ff8,
                 buffer_offset: 0,
                 length: 8,
+                fault_range: request.validation_ranges[0],
             }]
         );
     }

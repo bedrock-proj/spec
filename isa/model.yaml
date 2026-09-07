@@ -127,20 +127,6 @@ sail:
 
 documents:
   topics:
-  - id: manual.part.architectural-foundations
-    source: artifacts/isa-reference/document/topics/001_architectural_foundations.tex
-  - id: architecture.overview.section
-    source: artifacts/isa-reference/document/topics/overview/001_section.tex
-  - id: architecture.overview.contract-position
-    source: artifacts/isa-reference/document/topics/overview/002_contract_position.tex
-  - id: architecture.overview.manual-scope
-    source: artifacts/isa-reference/document/topics/overview/003_manual_scope.tex
-  - id: architecture.overview.profile
-    source: artifacts/isa-reference/document/topics/overview/004_architectural_profile.tex
-  - id: manual.about.normative-material
-    source: artifacts/isa-reference/document/topics/about/001_normative_material.tex
-  - id: architecture.terminology.section
-    source: artifacts/isa-reference/document/topics/terminology/001_section.tex
   - id: registers.register-model.programming-model
     source: registers/documents/topics/register_model/001_programming_model.tex
   - id: registers.register-model.register-model
@@ -161,8 +147,6 @@ documents:
     source: encoding/documents/data/topics/data_formats/002_integer_data_sizes.tex
   - id: encoding.data.data-formats.little-endian-memory-organization
     source: encoding/documents/data/topics/data_formats/003_little_endian_memory_organization.tex
-  - id: manual.part.encoding-addressing-and-execution
-    source: artifacts/isa-reference/document/topics/002_encoding_addressing_and_execution.tex
   - id: encoding.instruction.instruction-word-formats.instruction-encoding
     source: encoding/documents/instruction/topics/instruction_word_formats/001_instruction_encoding.tex
   - id: encoding.instruction.instruction-word-formats.instruction-stream-and-record-boundary
@@ -241,8 +225,6 @@ documents:
     source: memory/ordering/documents/topics/memory_model/009_global_sequentially_consistent_order.tex
   - id: repeat.streaming-execution-model.repeated-scalar-execution
     source: repeat/documents/topics/streaming_execution_model/001_repeated_scalar_execution.tex
-  - id: manual.part.system-programming
-    source: artifacts/isa-reference/document/topics/003_system_programming.tex
   - id: privilege.privileged-programming-model.privileged-execution-model
     source: privilege/documents/topics/privileged_programming_model/001_privileged_execution_model.tex
   - id: privilege.privileged-programming-model.privilege-and-event-state
@@ -337,8 +319,6 @@ documents:
     source: state/documents/topics/save_restore_area/003_base_supervisor_state_record.tex
   - id: state.save-restore-area.state-record-transfer-semantics
     source: state/documents/topics/save_restore_area/004_state_record_transfer_semantics.tex
-  - id: manual.part.instruction-set-reference
-    source: artifacts/isa-reference/document/topics/004_instruction_set_reference.tex
   - id: instructions.instruction-description-intro.reading-an-instruction-description
     source: instructions/documents/topics/instruction_description_intro/001_reading_an_instruction_description.tex
   - id: instructions.instruction-description-intro.entry-organization

@@ -1,6 +1,4 @@
 generator: generator.py
-inputs:
-- isa
 depends-on:
 - systemverilog-package
 outputs:

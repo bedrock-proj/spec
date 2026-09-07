@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 import re
 
-from engine.metasyntax import Metasyntax, MetasyntaxError
+from engine.syntax.metasyntax import Metasyntax, MetasyntaxError
 
 
 class RelocationMetasyntaxError(MetasyntaxError):
@@ -22,6 +24,10 @@ class RelocationExpression:
     value: int | None = None
     operands: tuple["RelocationExpression", ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "operands", tuple(self.operands))
+
+
 
 _TERMS = frozenset(
     {
@@ -35,7 +41,7 @@ _TERMS = frozenset(
         "symbol_size",
     }
 )
-_FUNCTION_ARITY = {
+_FUNCTION_ARITY = MappingProxyType({
     "copy": 2,
     "got": 1,
     "plt": 1,
@@ -43,7 +49,7 @@ _FUNCTION_ARITY = {
     "tls": 1,
     "tls_descriptor": 1,
     "tlsdesc": 1,
-}
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,13 +58,12 @@ class RelocationMetasyntax(Metasyntax):
 
     expression: RelocationExpression = field(init=False)
 
-    def _validate(self) -> None:
-        if not isinstance(self.code, str) or not self.code:
-            raise RelocationMetasyntaxError(
-                "relocation calculation must be a non-empty string"
-            )
+    def __post_init__(self) -> None:
         expression = _RelocationParser(self.code).parse()
         object.__setattr__(self, "expression", expression)
+
+    def _validate(self) -> None:
+        _RelocationParser(self.code).parse()
 
     def evaluate(self, context: Mapping[str, object]) -> int | tuple[int, int]:
         """Evaluate an integer relocation expression in one symbol context."""
@@ -68,6 +73,10 @@ class RelocationMetasyntax(Metasyntax):
 
 class _RelocationParser:
     def __init__(self, code: str) -> None:
+        if not isinstance(code, str) or not code:
+            raise RelocationMetasyntaxError(
+                "relocation calculation must be a non-empty string"
+            )
         self.code = code
         self.index = 0
 
@@ -193,7 +202,7 @@ def _evaluate(
     if expression.name == "resolver":
         resolver = context.get("resolver")
         if callable(resolver):
-            return int(resolver(values[0]))
+            return _integer_context(resolver(values[0]), "resolver")
         raise ValueError("relocation resolver context requires a callable resolver")
     if expression.name == "copy":
         return values[0]

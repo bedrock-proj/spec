@@ -51,7 +51,7 @@ function empty_primitive_request() -> Primitive_request = struct {
     debug_validation = false,
     debug_validated = false,
     physical_address = 0x0000000000000000,
-    memory_ranges = [||],
+    memory_ranges = [||], validation_ranges = [||],
     read_completion = ReadCompletionData,
     memory_cache_hint = MemoryCacheDefault,
     commit_point = false,

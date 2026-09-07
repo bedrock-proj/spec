@@ -13,15 +13,30 @@ function ea_segment_index(ea : Decoded_ea) -> int = match ea.segment {
   _ => 1,
 }
 
-function ea_signed_payload(ea : Decoded_ea) -> bits(64) =
-  if not_bool(ea.payload_signed) then ea.payload
-  else if ea.payload_width == 8 then sail_sign_extend(ea.payload[7 .. 0], 64)
-  else if ea.payload_width == 16 then sail_sign_extend(ea.payload[15 .. 0], 64)
-  else if ea.payload_width == 32 then sail_sign_extend(ea.payload[31 .. 0], 64)
-  else ea.payload
+function ea_payload_width(role : Ea_payload_role, payloads : list(Decoded_ea_payload)) -> int = match payloads {
+  [||] => 0,
+  payload :: tail => if payload.definition.role == role then payload.definition.width else ea_payload_width(role, tail),
+}
+
+function ea_payload_value(role : Ea_payload_role, payloads : list(Decoded_ea_payload)) -> bits(64) = match payloads {
+  [||] => 0x0000000000000000,
+  payload :: tail => if payload.definition.role == role then {
+    let width = payload.definition.width;
+    if payload.definition.signed & width > 0 & width < 64 &
+       sail_shiftright(payload.value, width - 1)[0] == bitone
+    then payload.value | sail_shiftleft(0xFFFFFFFFFFFFFFFF, width)
+    else payload.value
+  } else ea_payload_value(role, tail),
+}
 
 function staged_register(index : int, value : bits(64)) -> list(Staged_register_update) =
   [|struct { index = get_slice_int(4, index, 0), value = value }|]
+
+function append_staged_register_updates(left : list(Staged_register_update), right : list(Staged_register_update))
+  -> list(Staged_register_update) = match left {
+  [||] => right,
+  update :: tail => update :: append_staged_register_updates(tail, right),
+}
 
 function image_register(state : Cpu_state, index : int) -> bits(64) =
   state.registers[unsigned(get_slice_int(4, index, 0))]
@@ -43,11 +58,66 @@ function clause ea_update_amount(EaUpdateDifference_scale, _, width) = width
 
 function clause ea_update_amount(EaUpdateDifference_constant_1, _, _) = 1
 
-function decoded_ea_update_amount(ea : Decoded_ea, image : Cpu_state, width : int) -> bits(64) =
-  match ea.update_difference {
-    Some(difference) => get_slice_int(64, ea_update_amount(difference, image, width), 0),
+function ea_autoupdate_for(target : Ea_update_target, updates : list(Ea_autoupdate)) -> option(Ea_autoupdate) =
+  match updates {
+    [||] => None(),
+    update :: tail => if update.target == target then Some(update) else ea_autoupdate_for(target, tail),
+  }
+
+function ea_autoupdate_mode(update : option(Ea_autoupdate)) -> option(Ea_update_mode) = match update {
+  Some(value) => Some(value.mode), None() => None(),
+}
+
+function decoded_ea_update_amount(update : option(Ea_autoupdate), image : Cpu_state, width : int) -> bits(64) =
+  match update {
+    Some(value) => get_slice_int(64, ea_update_amount(value.difference, image, width), 0),
     None() => 0x0000000000000000,
   }
+
+function evaluate_ea_expression_steps(expression : Ea_expression, stack : list(bits(64)), ea : Decoded_ea,
+                                      image : Cpu_state, instruction_pc : bits(64), width : int,
+                                      base_value : bits(64), index_value : bits(64)) -> bits(64) =
+  match expression {
+    [||] => match stack {
+      [|value|] => value,
+      _ => { assert(false, "invalid EA expression result stack"); 0x0000000000000000 },
+    },
+    step :: tail => {
+      let next_stack : list(bits(64)) = match step {
+        EaExprLiteral(value) => value :: stack,
+        EaExprField(EaRole_base) => base_value :: stack,
+        EaExprField(EaRole_index) => index_value :: stack,
+        EaExprField(role) => (match ea_field_role(role, ea.fields) {
+          Some(index) => image_segment(image, index + 1),
+          None() => 0x0000000000000000,
+        }) :: stack,
+        EaExprPayload(role) => ea_payload_value(role, ea.payloads) :: stack,
+        EaExprScale(difference) => get_slice_int(64, ea_update_amount(difference, image, width), 0) :: stack,
+        EaExprGpr(index) => image.registers[unsigned(index)] :: stack,
+        EaExprSp() => image.sp :: stack,
+        EaExprPc() => instruction_pc :: stack,
+        EaExprNegate() => match stack {
+          value :: rest => sub_bits(0x0000000000000000, value) :: rest,
+          _ => { assert(false, "invalid EA negation stack"); [||] },
+        },
+        operation => match stack {
+          right :: left :: rest => (match operation {
+            EaExprAdd() => add_bits(left, right),
+            EaExprSubtract() => sub_bits(left, right),
+            EaExprMultiply() => get_slice_int(64, unsigned(left) * unsigned(right), 0),
+            _ => { assert(false, "invalid EA binary operation"); 0x0000000000000000 },
+          }) :: rest,
+          _ => { assert(false, "invalid EA binary expression stack"); [||] },
+        },
+      };
+      evaluate_ea_expression_steps(tail, next_stack, ea, image, instruction_pc, width, base_value, index_value)
+    },
+  }
+
+function evaluate_ea_expression(expression : Ea_expression, ea : Decoded_ea,
+                                image : Cpu_state, instruction_pc : bits(64), width : int,
+                                base_value : bits(64), index_value : bits(64)) -> bits(64) =
+  evaluate_ea_expression_steps(expression, [||], ea, image, instruction_pc, width, base_value, index_value)
 
 struct Segment_point = {
   in_bounds : bool,
@@ -81,54 +151,54 @@ function evaluate_decoded_ea(operand : Decoded_operand, ea : Decoded_ea,
   var updates : list(Staged_register_update) = [||];
   let base_index = ea_field_role(EaRole_base, ea.fields);
   let index_index = ea_field_role(EaRole_index, ea.fields);
-  let update_amount = decoded_ea_update_amount(ea, image, width);
-  var base_value : bits(64) = if ea.base == Some(EaBase_SP) then image.sp
-    else if ea.base == Some(EaBase_PC) then instruction_pc
-    else if ea.base == Some(EaBase_zero) then 0x0000000000000000
-    else match base_index {
+  let base_update = ea_autoupdate_for(EaUpdateTarget_base, ea.autoupdates);
+  let index_update = ea_autoupdate_for(EaUpdateTarget_index, ea.autoupdates);
+  let base_amount = decoded_ea_update_amount(base_update, image, width);
+  let index_amount = decoded_ea_update_amount(index_update, image, width);
+  var base_value : bits(64) = match base_index {
       Some(index) => image_register(image, index),
       None() => 0x0000000000000000,
     };
-  if ea.update_target == Some(EaUpdateTarget_b) & ea.update_mode == Some(EaUpdateMode_predecrement) then match base_index {
+  if ea_autoupdate_mode(base_update) == Some(EaUpdateMode_predecrement) then match base_index {
     Some(index) => {
       let reg_index = unsigned(get_slice_int(4, index, 0));
-      let changed = sub_bits(image.registers[reg_index], update_amount);
+      let changed = sub_bits(image.registers[reg_index], base_amount);
       staged.registers[reg_index] = changed; base_value = changed;
       updates = staged_register(index, changed)
     },
     None() => (),
   } else ();
+  if ea_autoupdate_mode(base_update) == Some(EaUpdateMode_postincrement) then match base_index {
+    Some(index) => {
+      let reg_index = unsigned(get_slice_int(4, index, 0));
+      let changed = add_bits(image.registers[reg_index], base_amount);
+      staged.registers[reg_index] = changed; updates = staged_register(index, changed)
+    },
+    None() => (),
+  } else ();
   var index_value : bits(64) = match index_index {
-    Some(index) => image_register(image, index),
+    Some(index) => image_register(staged, index),
     None() => 0x0000000000000000,
   };
-  if ea.update_target == Some(EaUpdateTarget_i) & ea.update_mode == Some(EaUpdateMode_predecrement) then match index_index {
+  if ea_autoupdate_mode(index_update) == Some(EaUpdateMode_predecrement) then match index_index {
     Some(index) => {
       let reg_index = unsigned(get_slice_int(4, index, 0));
-      let changed = sub_bits(image.registers[reg_index], update_amount);
+      let changed = sub_bits(staged.registers[reg_index], index_amount);
       staged.registers[reg_index] = changed; index_value = changed;
-      updates = staged_register(index, changed)
+      updates = append_staged_register_updates(updates, staged_register(index, changed))
     },
     None() => (),
   } else ();
-  let scaled_index = sail_shiftleft(index_value, ea_width_shift(width));
-  let offset = add_bits(add_bits(base_value, scaled_index), ea_signed_payload(ea));
-  if ea.update_target == Some(EaUpdateTarget_b) & ea.update_mode == Some(EaUpdateMode_postincrement) then match base_index {
+  if ea_autoupdate_mode(index_update) == Some(EaUpdateMode_postincrement) then match index_index {
     Some(index) => {
       let reg_index = unsigned(get_slice_int(4, index, 0));
-      let changed = add_bits(image.registers[reg_index], update_amount);
-      staged.registers[reg_index] = changed; updates = staged_register(index, changed)
-    },
-    None() => (),
-  } else if ea.update_target == Some(EaUpdateTarget_i) & ea.update_mode == Some(EaUpdateMode_postincrement) then match index_index {
-    Some(index) => {
-      let reg_index = unsigned(get_slice_int(4, index, 0));
-      let changed = add_bits(image.registers[reg_index], update_amount);
-      staged.registers[reg_index] = changed; updates = staged_register(index, changed)
+      let changed = add_bits(staged.registers[reg_index], index_amount);
+      staged.registers[reg_index] = changed; updates = append_staged_register_updates(updates, staged_register(index, changed))
     },
     None() => (),
   } else ();
-  let direct_value = if ea.kind == EaKind_immediate then ea_signed_payload(ea) else offset;
+  let offset = evaluate_ea_expression(ea.expression, ea, staged, instruction_pc, width, base_value, index_value);
+  let direct_value = offset;
   let point = if ea.kind == EaKind_immediate then direct_value else offset;
   let segment = ea_segment_index(ea);
   let selected_segment = image_segment(image, segment);
@@ -144,66 +214,8 @@ function evaluate_decoded_ea(operand : Decoded_operand, ea : Decoded_ea,
 
 function evaluate_decoded_vector_ea(operand : Decoded_operand, ea : Decoded_ea,
                                     image : Cpu_state, instruction_pc : bits(64),
-                                    width : int) -> (Ea_evaluation, Cpu_state) = {
-  var staged = image;
-  var updates : list(Staged_register_update) = [||];
-  let base_index = ea_field_role(EaRole_base, ea.fields);
-  let index_index = ea_field_role(EaRole_index, ea.fields);
-  let update_amount = decoded_ea_update_amount(ea, image, width);
-  var base_value : bits(64) = if ea.base == Some(EaBase_SP) then image.sp
-    else if ea.base == Some(EaBase_PC) then instruction_pc
-    else if ea.base == Some(EaBase_zero) then 0x0000000000000000
-    else match base_index {
-      Some(index) => image_register(image, index), None() => 0x0000000000000000,
-    };
-  if ea.update_target == Some(EaUpdateTarget_b) & ea.update_mode == Some(EaUpdateMode_predecrement) then match base_index {
-    Some(index) => {
-      let reg_index = unsigned(get_slice_int(4, index, 0));
-      let changed = sub_bits(image.registers[reg_index], update_amount);
-      staged.registers[reg_index] = changed; base_value = changed;
-      updates = staged_register(index, changed)
-    },
-    None() => (),
-  } else ();
-  var index_value : bits(64) = match index_index {
-    Some(index) => image_register(image, index), None() => 0x0000000000000000,
-  };
-  if ea.update_target == Some(EaUpdateTarget_i) & ea.update_mode == Some(EaUpdateMode_predecrement) then match index_index {
-    Some(index) => {
-      let reg_index = unsigned(get_slice_int(4, index, 0));
-      let changed = sub_bits(image.registers[reg_index], update_amount);
-      staged.registers[reg_index] = changed; index_value = changed;
-      updates = staged_register(index, changed)
-    },
-    None() => (),
-  } else ();
-  let scaled_index = sail_shiftleft(index_value, ea_width_shift(width));
-  let offset = add_bits(add_bits(base_value, scaled_index), ea_signed_payload(ea));
-  if ea.update_target == Some(EaUpdateTarget_b) & ea.update_mode == Some(EaUpdateMode_postincrement) then match base_index {
-    Some(index) => {
-      let reg_index = unsigned(get_slice_int(4, index, 0));
-      let changed = add_bits(image.registers[reg_index], update_amount);
-      staged.registers[reg_index] = changed; updates = staged_register(index, changed)
-    },
-    None() => (),
-  } else if ea.update_target == Some(EaUpdateTarget_i) & ea.update_mode == Some(EaUpdateMode_postincrement) then match index_index {
-    Some(index) => {
-      let reg_index = unsigned(get_slice_int(4, index, 0));
-      let changed = add_bits(image.registers[reg_index], update_amount);
-      staged.registers[reg_index] = changed; updates = staged_register(index, changed)
-    },
-    None() => (),
-  } else ();
-  let segment = ea_segment_index(ea);
-  let selected_segment = image_segment(image, segment);
-  let translated = segment_point(selected_segment, offset);
-  (struct {
-    operand_name = operand.name, kind = EaKind_memory, role = operand.ea_role,
-    domain = operand.domain, segment = segment, segment_image = selected_segment, width = width,
-    effective_address = offset, linear_address = translated.linear, value = offset,
-    staged_updates = updates
-  }, staged)
-}
+                                    width : int) -> (Ea_evaluation, Cpu_state) =
+  evaluate_decoded_ea(operand, { ea with kind = EaKind_memory }, image, instruction_pc, width)
 
 function evaluate_vector_instruction_ea(operands : list(Decoded_operand), image : Cpu_state,
                                         instruction_pc : bits(64), width : int)

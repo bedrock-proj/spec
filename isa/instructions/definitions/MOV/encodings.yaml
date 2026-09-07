@@ -2,6 +2,7 @@ encodings:
   q_rn_r_sp:
     pattern: 101rrrr
     syntax: MOV.Q Rn(r), SP
+    fixed_operand_roles: [dst]
     fields:
       r:
         role: src
@@ -9,6 +10,7 @@ encodings:
   q_sp_rn_r:
     pattern: 110rrrr
     syntax: MOV.Q SP, Rn(r)
+    fixed_operand_roles: [src]
     fields:
       r:
         role: dst

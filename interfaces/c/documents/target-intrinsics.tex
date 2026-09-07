@@ -47,7 +47,7 @@ integer, floating-point, and vector families. \texttt{<bedrocksystemintrin.h>} i
 umbrella for system-register, cache, and MMU facilities. Any
 family header may also be included directly.
 
-\BedrockGeneratedHeaderFamilies{}
+(:intrinsic-groups:cache,core,fpu,integer,memory,mmu,sysreg,vector:)
 
 \subsection{Common Compilation Rules}
 Family wrappers are static inline functions unless an encoded immediate or
@@ -74,23 +74,23 @@ the ISA.
 
 \subsection{Core Builtins}
 \BedrockField{Header:}{\texttt{<bedrockcoreintrin.h>}}
-\BedrockGeneratedIntrinsicGroup{core}
+(:intrinsic-group:core:)
 
 \subsection{Memory Builtins}
 \BedrockField{Header:}{\texttt{<bedrockmemoryintrin.h>}}
-\BedrockGeneratedIntrinsicGroup{memory}
+(:intrinsic-group:memory:)
 
 \subsection{Integer Builtins}
 \BedrockField{Header:}{\texttt{<bedrockintegerintrin.h>}}
-\BedrockGeneratedIntrinsicGroup{integer}
+(:intrinsic-group:integer:)
 
 \subsection{Floating-Point Builtins}
 \BedrockField{Header:}{\texttt{<bedrockfpuintrin.h>}}
-\BedrockGeneratedIntrinsicGroup{fpu}
+(:intrinsic-group:fpu:)
 
 \subsection{Vector Builtins}
 \BedrockField{Header:}{\texttt{<bedrockvectorintrin.h>}}
-\BedrockGeneratedIntrinsicGroup{vector}
+(:intrinsic-group:vector:)
 
 \subsection{Approximate Transcendental Lowering Policy}
 A strict language-library operation shall not be lowered to an FPTRANSA
@@ -105,7 +105,7 @@ remain active.
 
 \subsection{System-Register Builtins}
 \BedrockField{Header:}{\texttt{<bedrocksysregintrin.h>}}
-\BedrockGeneratedIntrinsicGroup{sysreg}
+(:intrinsic-group:sysreg:)
 
 The system-register header defines \texttt{\_\_bedrock\_control\_register\_t} constants for every published
 control-register selector. The constants are names for the architectural selector values; they do not weaken the
@@ -148,13 +148,13 @@ architectural cache-maintenance sequence is required. An implementation may
 diagnose a provably wrapping constant range. A valid range end is calculated
 mathematically, not modulo $2^{64}$.
 
-\BedrockGeneratedIntrinsicGroup{cache}
+(:intrinsic-group:cache:)
 
 \subsection{MMU Builtins}
 \BedrockField{Header:}{\texttt{<bedrockmmuintrin.h>}}
-\BedrockGeneratedIntrinsicGroup{mmu}
+(:intrinsic-group:mmu:)
 
 \section{Shared Header Types}\label{page:shared-header-types}
-\BedrockGeneratedInterfaceTypes{}
+(:intrinsic-types:base.types.core.performance_counter,base.types.mmu.query_result,base.types.sysreg.control_register,base.types.sysreg.segment_register:)
 
 \end{document}

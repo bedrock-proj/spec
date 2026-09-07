@@ -194,7 +194,7 @@ the entry-stack payload and the interpretation of initial arguments. This
 language-independent state permits an ELF entry point to establish the
 run-time convention selected by its implementation language.
 
-\BedrockGeneratedELFEntryStateTable
+(:elf-entry-state:)
 
 \clearpage
 \section{Sections and Symbols}\label{page:sections-and-symbols}
@@ -285,7 +285,7 @@ domain.
 \textbf{Type} & \textbf{Name} & \textbf{Size} & \textbf{Calculation}\\
 \midrule
 \endhead
-\BedrockGeneratedELFRelocationRows
+(:elf-relocations:base.relocations.R_BEDROCK_NONE,base.relocations.R_BEDROCK_ABS8,base.relocations.R_BEDROCK_ABS16,base.relocations.R_BEDROCK_ABS32S,base.relocations.R_BEDROCK_ABS64,base.relocations.R_BEDROCK_IMM8S,base.relocations.R_BEDROCK_IMM16S,base.relocations.R_BEDROCK_IMM32S,base.relocations.R_BEDROCK_IMM64,base.relocations.R_BEDROCK_DISP8S,base.relocations.R_BEDROCK_DISP16S,base.relocations.R_BEDROCK_DISP32S,base.relocations.R_BEDROCK_DISP64,base.relocations.R_BEDROCK_PCREL8S,base.relocations.R_BEDROCK_PCREL16S,base.relocations.R_BEDROCK_PCREL32S,base.relocations.R_BEDROCK_PCREL64,base.relocations.R_BEDROCK_BRDISP8S,base.relocations.R_BEDROCK_BRDISP16S,base.relocations.R_BEDROCK_BRDISP32S,base.relocations.R_BEDROCK_CALL16S,base.relocations.R_BEDROCK_CALL32S,base.relocations.R_BEDROCK_SECTION_REL32,base.relocations.R_BEDROCK_SECTION_REL64,base.relocations.R_BEDROCK_GOT64,base.relocations.R_BEDROCK_GOTPCREL32S,base.relocations.R_BEDROCK_GOTPCREL64,base.relocations.R_BEDROCK_GOTOFF32S,base.relocations.R_BEDROCK_GOTOFF64,base.relocations.R_BEDROCK_GOT_BASE_PCREL32S,base.relocations.R_BEDROCK_GOT_BASE_PCREL64,base.relocations.R_BEDROCK_PLT16S,base.relocations.R_BEDROCK_PLT32S,base.relocations.R_BEDROCK_PLT64,base.relocations.R_BEDROCK_RELATIVE,base.relocations.R_BEDROCK_GLOB_DAT,base.relocations.R_BEDROCK_JUMP_SLOT,base.relocations.R_BEDROCK_COPY,base.relocations.R_BEDROCK_IRELATIVE,base.relocations.R_BEDROCK_TLS_OFFSET32S,base.relocations.R_BEDROCK_TLS_OFFSET64,base.relocations.R_BEDROCK_TLSDESC_GOTPCREL32S,base.relocations.R_BEDROCK_TLSDESC_GOTPCREL64,base.relocations.R_BEDROCK_TLSDESC_CALL,base.relocations.R_BEDROCK_TLSDESC:)
 \bottomrule
 \end{longtable}
 \endgroup
@@ -570,7 +570,7 @@ relaxing any full-width form to a shorter encoding.
 The ELF ABI owns the architecture-wide DWARF register-number assignment used
 by every source language and unwind producer.
 
-\BedrockGeneratedELFDebugRegisterTable
+(:elf-debug-registers:)
 
 An unwind description that saves a vector or predicate register describes its
 complete MAX\_VLEN-dependent image. Predicate register locations contain the

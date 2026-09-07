@@ -38,7 +38,7 @@ function find_extended_ea(profile : Ea_profile, family : Ea_descriptor_family,
       else find_extended_ea(profile, family, bytes, cursor, tail),
   }
 
-val extracted_ea_field : (bits(64), list(range(0, 15)), int) -> int
+val extracted_ea_field : (bits(64), list(nat), int) -> int
 val decode_ea_field_list : (bits(64), list(Ea_field)) -> list(Decoded_field)
 
 function append_decoded_fields(left : list(Decoded_field), right : list(Decoded_field))
@@ -47,11 +47,29 @@ function append_decoded_fields(left : list(Decoded_field), right : list(Decoded_
   field :: tail => field :: append_decoded_fields(tail, right),
 }
 
-function decode_ea_fields(bytes : list(bits(8)), cursor : int, form : Ea_form) -> list(Decoded_field) =
-  match read_be_bits(bytes, cursor, ea_pattern_count(form.patterns) * 8) {
-    Some(raw) => decode_ea_field_list(raw, form.fields),
-    None() => [||],
+function extracted_ea_byte_field(bytes : list(bits(8)), cursor : int, descriptor_bytes : int,
+                                  positions : list(nat), accumulated : int) -> int =
+  match positions {
+    [||] => accumulated,
+    position :: tail => match byte_at(bytes, cursor + descriptor_bytes - 1 - tdiv_int(position, 8)) {
+      Some(byte) => extracted_ea_byte_field(bytes, cursor, descriptor_bytes, tail,
+        accumulated * 2 + (if byte[unsigned(get_slice_int(3, position, 0))] == bitone then 1 else 0)),
+      None() => { assert(false, "selected EA descriptor is incomplete"); 0 },
+    },
   }
+
+function decode_ea_byte_fields(bytes : list(bits(8)), cursor : int, descriptor_bytes : int,
+                                fields : list(Ea_field)) -> list(Decoded_field) = match fields {
+  [||] => [||],
+  field :: tail => struct {
+    symbol = field.symbol, operand_type = field.operand_type, kind = FieldBits,
+    role = Some(field.role),
+    value = extracted_ea_byte_field(bytes, cursor, descriptor_bytes, field.positions, 0)
+  } :: decode_ea_byte_fields(bytes, cursor, descriptor_bytes, tail),
+}
+
+function decode_ea_fields(bytes : list(bits(8)), cursor : int, form : Ea_form) -> list(Decoded_field) =
+  decode_ea_byte_fields(bytes, cursor, ea_pattern_count(form.patterns), form.fields)
 
 function decode_ea_field_list(raw : bits(64), fields : list(Ea_field)) -> list(Decoded_field) =
   match fields {
@@ -65,13 +83,25 @@ function decode_ea_field_list(raw : bits(64), fields : list(Ea_field)) -> list(D
     } :: decode_ea_field_list(raw, tail),
   }
 
-function extracted_ea_field(payload : bits(64), positions : list(range(0, 15)), accumulated : int) -> int =
+function extracted_ea_field(payload : bits(64), positions : list(nat), accumulated : int) -> int =
   match positions {
     [||] => accumulated,
     position :: tail => extracted_ea_field(
-      payload, tail, accumulated * 2 + (if payload[position] == bitone then 1 else 0)
+      payload, tail, accumulated * 2 + (if sail_shiftright(payload, position)[0] == bitone then 1 else 0)
     ),
   }
+
+function composed_ea_autoupdates(compact : Ea_form, descriptor : option(Ea_form)) -> list(Ea_autoupdate) = {
+  let tail : list(Ea_autoupdate) = match descriptor {
+    Some(form) => match form.autoupdate {
+      Some(update) => [|update|], None() => [||],
+    },
+    None() => [||],
+  };
+  match compact.autoupdate {
+    Some(update) => update :: tail, None() => tail,
+  }
+}
 
 function parse_one_ea_descriptor(operand_name : Operand_id, operand_width : option(Ea_width), profile : Ea_profile,
                                  raw_value : int, bytes : list(bits(8)), cursor : int)
@@ -99,15 +129,6 @@ function parse_one_ea_descriptor(operand_name : Operand_id, operand_width : opti
           Some(form) => decode_ea_fields(bytes, descriptor_cursor, form),
           None() => [||],
         };
-        let update_target : option(Ea_update_target) = match descriptor {
-          Some(form) => form.update_target, None() => None()
-        };
-        let update_mode : option(Ea_update_mode) = match descriptor {
-          Some(form) => form.update_mode, None() => None()
-        };
-        let update_difference : option(Ea_update_difference) = match descriptor {
-          Some(form) => form.update_difference, None() => None()
-        };
         let resolved_kind : Ea_kind = match descriptor {
           Some(form) => form.kind, None() => compact.kind
         };
@@ -120,7 +141,12 @@ function parse_one_ea_descriptor(operand_name : Operand_id, operand_width : opti
         let compact_fields = decode_ea_field_list(
           sail_zero_extend(get_slice_int(16, raw_value, 0), 64), compact.fields
         );
-        Some((struct {
+        let resolved_expression : option(Ea_expression) = match descriptor {
+          Some(form) => form.expression, None() => compact.expression
+        };
+        match resolved_expression {
+        None() => None(),
+        Some(expression) => Some((struct {
           operand_name = operand_name,
           ea = struct {
             compact_name = compact.name,
@@ -128,19 +154,20 @@ function parse_one_ea_descriptor(operand_name : Operand_id, operand_width : opti
             kind = resolved_kind,
             segment = resolved_segment,
             base = resolved_base,
+            expression = expression,
             operand_width = operand_width,
             descriptor_name = descriptor_name,
             raw = raw_value,
             descriptor_bytes = descriptor_bytes,
             fields = append_decoded_fields(compact_fields, descriptor_fields),
-            payload = 0x0000000000000000,
-            payload_width = compact.payload_width,
-            payload_signed = compact.payload_signed,
-            update_target = update_target,
-            update_mode = update_mode,
-            update_difference = update_difference
+            payload_layout = append_ea_payload_layout(compact.payloads, match descriptor {
+              Some(form) => form.payloads, None() => [||]
+            }),
+            payloads = [||],
+            autoupdates = composed_ea_autoupdates(compact, descriptor)
           }
-        }, cursor + descriptor_bytes))
+        }, cursor + descriptor_bytes)),
+        }
       }
     },
   }

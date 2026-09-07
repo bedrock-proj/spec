@@ -1,50 +1,43 @@
-"""ELF ABI document projection from the typed ELF object catalog."""
-
-from abi.elf.model import ElfAbiProject
-from engine.generation import (
-    AuthoredTexArtifactGenerator,
-    GeneratedArtifact,
-    GeneratedArtifactSet,
-)
+"""ELF ABI document serialization from selected semantic rows."""
+from __future__ import annotations
+from engine.documents.abi import ElfRelocationsProjection, ElfDebugRegistersProjection, ElfEntryStateProjection
+from abi.elf.model.projection import project_elf_abi
+from artifacts._shared.documents import authored_tex_generate, build_document, authored_document_source
 
 
-_ROWS_INPUT = r"\BedrockGeneratedELFRelocationRows"
-_DEBUG_REGISTER_TABLE_INPUT = r"\BedrockGeneratedELFDebugRegisterTable"
-_ENTRY_STATE_TABLE_INPUT = r"\BedrockGeneratedELFEntryStateTable"
+def _inputs(context):
+    isa = context.workspace.require_provider("isa")
+    project = context.workspace.require_provider("abi.elf")
+    projection = context.shared_result((project_elf_abi, id(project), id(isa)), lambda: project_elf_abi(project, isa))
+    return {"isa": isa, "abi.elf": projection}
 
 
-class Generator(AuthoredTexArtifactGenerator):
-    """Publish authored prose with the relocation table derived from YAML."""
-
-    def generate(self, context):
-        provider = context.require_provider("abi.elf")
-        if not isinstance(provider, ElfAbiProject):
-            raise TypeError("abi.elf provider must be an ElfAbiProject")
-        generated = super().generate(context)
-        artifacts = tuple(
-            GeneratedArtifact(
-                artifact.relative_path,
-                artifact.content
-                .replace(_ROWS_INPUT, _relocation_rows(provider))
-                .replace(
-                    _DEBUG_REGISTER_TABLE_INPUT,
-                    _debug_register_table(provider, context.workspace),
-                )
-                .replace(
-                    _ENTRY_STATE_TABLE_INPUT,
-                    _entry_state_table(provider, context.workspace),
-                ),
-            )
-            for artifact in generated.artifacts
-        )
-        if any("BedrockGeneratedELF" in item.content for item in artifacts):
-            raise AssertionError("ELF ABI table projection remained unresolved")
-        return GeneratedArtifactSet(artifacts, generated.artifact_id)
+def render_source(definition, context):
+    return authored_document_source(definition, context, _inputs(context), render_fragment=render_fragment)
 
 
-def _relocation_rows(project: ElfAbiProject) -> str:
+def validate(definition, context):
+    render_source(definition, context)
+
+
+def generate(definition, context):
+    return authored_tex_generate(definition, render_source(definition, context))
+
+
+def build(definition, context, *, compile_pdf, latexmk="latexmk"):
+    return build_document(definition, context, compile_pdf=compile_pdf, latexmk=latexmk)
+
+
+def render_fragment(projection, labels):
+    if isinstance(projection, ElfRelocationsProjection): return _relocation_rows(projection)
+    if isinstance(projection, ElfDebugRegistersProjection): return _debug_register_table(projection)
+    if isinstance(projection, ElfEntryStateProjection): return _entry_state_table(projection)
+    raise TypeError(f"unsupported ELF ABI fragment {type(projection).__name__}")
+
+
+def _relocation_rows(projection) -> str:
     rows = []
-    for relocation in sorted(project.relocations.values(), key=lambda item: item.value):
+    for relocation in sorted(projection.relocations, key=lambda item: item.value):
         result = relocation.result
         if result.kind.value == "none":
             size = "0"
@@ -67,10 +60,10 @@ def _code(value: str) -> str:
     return rf"\texttt{{{escaped}}}"
 
 
-def _debug_register_table(project: ElfAbiProject, workspace) -> str:
+def _debug_register_table(projection) -> str:
     rows: list[str] = []
     for assignment in sorted(
-        project.resolved_debug_registers(workspace), key=lambda item: item.first
+        projection.assignments, key=lambda item: item.first
     ):
         number = (
             f"{assignment.first} and greater"
@@ -82,12 +75,14 @@ def _debug_register_table(project: ElfAbiProject, workspace) -> str:
         registers = (
             "---"
             if not assignment.registers
-            else _register_display(assignment.registers, workspace)
+            else _register_display(assignment.registers)
         )
         status = assignment.status
         if assignment.condition is not None:
             status = f"{status}; {assignment.condition}"
-        rows.append(f"{number} & {_code(registers) if registers != '---' else registers} & {status}\\\\")
+        rows.append(
+            f"{number} & {_code(registers) if registers != '---' else registers} & {status}\\\\"
+        )
     return "\n".join(
         (
             r"\BedrockTableCaption{Bedrock DWARF Register Numbers}",
@@ -108,34 +103,32 @@ def _debug_register_table(project: ElfAbiProject, workspace) -> str:
             r"\end{BedrockLongTable}",
         )
     )
-
-
-def _register_display(registers, workspace) -> str:
-    names = [workspace.resolve(item).id for item in registers]
+def _register_display(registers) -> str:
+    names = [item.id for item in registers]
     if len(names) == 1:
         return names[0]
     return f"{names[0]}..{names[-1]}"
 
 
-def _entry_state_table(project: ElfAbiProject, workspace) -> str:
-    state = project.process_entry
+def _entry_state_table(projection) -> str:
+    state = projection.state
     segments = "/".join(
-        workspace.resolve(state.segment_contexts[role]).id
+        state.segment_contexts[role].id
         for role in ("code", "data", "stack")
     )
     permissions = "/".join(state.stack_permissions)
-    cleared = ", ".join(workspace.resolve(item).id for item in state.cleared)
+    cleared = ", ".join(item.id for item in state.cleared)
     readiness = ", ".join(item.replace("_", " ") for item in state.readiness)
-    entry_pc = f"{workspace.resolve(state.entry_point).id} = {state.entry_point_source}"
+    entry_pc = f"{state.entry_point.id} = {state.entry_point_source}"
     entry_stack = (
-        f"{workspace.resolve(state.stack).id}, {state.stack_alignment_bytes}-byte aligned, "
+        f"{state.stack.id}, {state.stack_alignment_bytes}-byte aligned, "
         f"{permissions}"
     )
     rows = (
         f"Entry PC & {_code(entry_pc)}\\\\",
         f"Entry stack & {_code(entry_stack)}\\\\",
         f"Segment contexts & {_code(segments)}\\\\",
-        f"TLS base & {_code(workspace.resolve(state.tls_base).id if state.tls_base else 'absent')}\\\\",
+        f"TLS base & {_code(state.tls_base.id if state.tls_base else 'absent')}\\\\",
         f"Readiness & {readiness}\\\\",
         f"Cleared state & {_code(cleared)}\\\\",
         f"Stack payload owner & {_code(state.payload_owner)}\\\\",
@@ -153,5 +146,3 @@ def _entry_state_table(project: ElfAbiProject, workspace) -> str:
             r"\end{BedrockLongTable}",
         )
     )
-
-__all__ = ["Generator"]

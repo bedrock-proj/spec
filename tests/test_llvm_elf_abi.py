@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+from abi.elf.model.projection import project_elf_abi
+
+from abi.elf.model.project import resolve_debug_registers
+
+from engine.artifacts.definition import load_artifact_definition
+
+from engine.artifacts.registry import ArtifactGeneratorRegistry, load_artifact_registry
+from engine.artifacts.generate import artifact_context
+
 from collections.abc import Mapping
 from importlib import import_module
 from pathlib import Path
@@ -9,10 +18,11 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
-from abi.elf.model import ElfAbiProject, RelocationMetasyntax
-from engine.generation import ArtifactDefinition, ArtifactGenerationContext
-from engine.workspace import SpecWorkspace
-from engine.yaml_document import YamlDocumentLoader
+from abi.elf.model.project import ElfAbiProject
+from abi.elf.model.relocation_metasyntax import RelocationMetasyntax
+from engine.artifacts.definition import ArtifactDefinition
+from engine.workspace import load_workspace
+from engine.source.yaml import load_yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,18 +31,21 @@ ROOT = Path(__file__).resolve().parents[1]
 class LlvmElfAbiArtifactTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.workspace = SpecWorkspace.load(ROOT)
-        schema = YamlDocumentLoader().mapping(ROOT / "artifacts/schema.yaml")
-        definition = ArtifactDefinition.load(
-            ROOT / "artifacts/llvm-elf-abi/artifact.yaml", schema
+        cls.workspace = load_workspace(ROOT)
+        definition = load_artifact_definition(
+            ROOT / "artifacts/llvm-elf-abi/artifact.yaml"
         )
         cls.generator_module = import_module("artifacts.llvm-elf-abi.generator")
         project = cls.workspace.require_provider("abi.elf")
         if not isinstance(project, ElfAbiProject):
             raise TypeError("workspace abi.elf provider must be an ElfAbiProject")
         cls.project = project
-        generated = cls.generator_module.Generator(definition).generate(
-            ArtifactGenerationContext.create(cls.workspace, ROOT)
+        cls.abi_projection = project_elf_abi(project, cls.workspace.require_provider("isa"))
+        generated = cls.generator_module.generate(
+            definition,
+            artifact_context(
+                load_artifact_registry(cls.workspace), cls.workspace, ROOT
+            ),
         )
         cls.relocations = generated.artifact(definition.outputs["relocations"]).content
         cls.catalog = generated.artifact(definition.outputs["catalog"]).content
@@ -66,7 +79,7 @@ class LlvmElfAbiArtifactTests(unittest.TestCase):
         code_models = list(self.project.code_models.values())
         tls_models = list(self.project.tls_models.values())
         protocols = list(self.project.linkage_protocols.values())
-        debug_ranges = self.project.resolved_debug_registers(self.workspace)
+        debug_ranges = resolve_debug_registers(self.project, self.workspace.require_provider("isa").registers)
         state = self.project.process_entry
         expected = {
             "BEDROCK_ELF_RELOCATION": len(relocations),
@@ -82,10 +95,7 @@ class LlvmElfAbiArtifactTests(unittest.TestCase):
                 len(item.relocations) for item in tls_models
             ),
             "BEDROCK_ELF_TLS_PROPERTY": sum(
-                self._property_count(
-                    item.data,
-                    {"id", "selection", "base_register", "protocol", "relocations"},
-                )
+                sum(path != ("selection",) for path, value in self.abi_projection.properties[item.reference])
                 for item in tls_models
             ),
             "BEDROCK_ELF_LINKAGE_PROTOCOL": len(protocols),
@@ -94,7 +104,7 @@ class LlvmElfAbiArtifactTests(unittest.TestCase):
                 len(contract.registers) for item in protocols for contract in item.state
             ),
             "BEDROCK_ELF_LINKAGE_PROPERTY": sum(
-                self._property_count(item.data, {"id", "steps", "state"})
+                len(self.abi_projection.properties[item.reference])
                 for item in protocols
             ),
             "BEDROCK_ELF_DEBUG_REGISTER_RANGE": len(debug_ranges),
@@ -161,26 +171,13 @@ class LlvmElfAbiArtifactTests(unittest.TestCase):
             )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    @staticmethod
-    def _property_count(data: object, excluded: set[str] | None = None) -> int:
-        if isinstance(data, Mapping):
-            return sum(
-                LlvmElfAbiArtifactTests._property_count(value)
-                for key, value in data.items()
-                if excluded is None or key not in excluded
-            )
-        if isinstance(data, list):
-            return sum(LlvmElfAbiArtifactTests._property_count(value) for value in data)
-        return 1
-
     def test_lld_expression_mapping_uses_the_parsed_ast(self) -> None:
         relocation = SimpleNamespace(
             id="R_BEDROCK_EQUIVALENT",
             source=Path("equivalent.yaml"),
             calculation=RelocationMetasyntax.parse("(symbol + addend) - place"),
         )
-        projection = self.generator_module.LlvmRelocationProjection.create(relocation)
-        self.assertEqual(projection.lld_expression, "PC")
+        self.assertEqual(self.generator_module._lld_expression(relocation), "PC")
 
     def test_unmapped_calculation_is_rejected_by_type(self) -> None:
         relocation = SimpleNamespace(
@@ -189,7 +186,7 @@ class LlvmElfAbiArtifactTests(unittest.TestCase):
             calculation=RelocationMetasyntax.parse("symbol - addend"),
         )
         with self.assertRaises(self.generator_module.UnmappedRelocationExpressionError):
-            self.generator_module.LlvmRelocationProjection.create(relocation)
+            self.generator_module._lld_expression(relocation)
 
 
 if __name__ == "__main__":

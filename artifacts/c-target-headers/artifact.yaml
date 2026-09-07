@@ -2,6 +2,7 @@ generator: generator.py
 inputs:
 - isa
 - interfaces.c
+- abi.c
 outputs:
   core: include/bedrockcoreintrin.h
   memory: include/bedrockmemoryintrin.h

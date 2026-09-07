@@ -37,28 +37,10 @@ function read_be_bits(bytes : list(bits(8)), cursor : int, width : int) -> optio
   }
 
 function read_encoding_bits(bytes : list(bits(8)), encoding_class : Encoding_class) -> option(bits(64)) =
-  match (encoding_class, bytes) {
-    (ExtraShort, byte0 :: _) => Some(sail_zero_extend(byte0[6 .. 0], 64)),
-    (Short, byte0 :: byte1 :: _) => Some(sail_zero_extend(byte0[5 .. 0] @ byte1, 64)),
-    (Medium, byte0 :: byte1 :: byte2 :: _) =>
-      Some(sail_zero_extend(byte0[1 .. 0] @ byte1 @ byte2, 64)),
-    (Long, byte0 :: byte1 :: byte2 :: byte3 :: _) =>
-      Some(sail_zero_extend(byte0[1 .. 0] @ byte1 @ byte2 @ byte3, 64)),
-    (ExtraLong, byte0 :: byte1 :: byte2 :: byte3 :: byte4 :: _) =>
-      Some(sail_zero_extend(byte0[1 .. 0] @ byte1 @ byte2 @ byte3 @ byte4, 64)),
-    (Xxlong, byte0 :: byte1 :: byte2 :: byte3 :: byte4 :: byte5 :: _) =>
-      Some(sail_zero_extend(byte0[1 .. 0] @ byte1 @ byte2 @ byte3 @ byte4 @ byte5, 64)),
-    _ => None(),
+  match read_be_bits(bytes, 0, 8 * encoding_primary_bytes(encoding_class)) {
+    Some(encoding) => Some(encoding & encoding_pattern_mask(encoding_class)),
+    None() => None(),
   }
-
-function encoding_class_of_record(record_class : Record_class) -> Encoding_class = match record_class {
-  FixedExtraShort => ExtraShort,
-  FixedShort => Short,
-  ExtendedMedium => Medium,
-  ExtendedLong => Long,
-  ExtendedExtraLong => ExtraLong,
-  ExtendedXxlong => Xxlong,
-}
 
 function find_catalog_entry(encoding : bits(64), encoding_class : Encoding_class,
                             entries : list(Catalog_entry)) -> option(Catalog_entry) =

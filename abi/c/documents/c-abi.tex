@@ -186,9 +186,21 @@ A flexible array member contributes zero element-storage bytes to \texttt{sizeof
 containing structure. Its offset is aligned for the element type, and that
 element alignment participates in the structure's alignment calculation.
 
-The baseline ABI uses the natural aggregate layout above. Packed aggregates,
-\texttt{\#pragma pack}, empty structures, and zero-length arrays have no
-external calling or object-layout contract in this ABI.
+For an external object, a supported source-language packing annotation is part
+of the declared object layout. A record-level \texttt{packed} annotation caps
+each member's placement alignment and the record alignment at one byte. A
+\texttt{\#pragma pack} limit caps each affected member's placement alignment
+and the record alignment at the declared limit. A field-level packing
+annotation caps that field's placement alignment at one byte. Fields remain in
+declaration order, unions still overlay their members, and the aggregate size
+is rounded to its resulting alignment. An array of such a type stores elements
+contiguously with stride \texttt{sizeof} its element type. These rules apply
+identically to an external definition and every compatible declaration.
+
+Packing changes placement and permitted access alignment; it does not change a
+member's value representation. Loads and stores through a packed member use
+the member's effective alignment. Empty structures and zero-length arrays have
+no external calling or object-layout contract in this ABI.
 
 \section{Register Convention}\label{page:register-convention}
 This section defines which architectural state survives an ordinary C call.
@@ -444,7 +456,7 @@ and passes its address in \texttt{R0} before ordinary argument assignment. The
 callee stores the result in that buffer and returns the same address in
 \texttt{R0}.
 
-\BedrockGeneratedCReturnRegisterTable
+(:c-return-rules:base.value_classes.GENERAL_SCALAR,base.value_classes.GENERAL_PAIR,base.value_classes.FLOAT_SCALAR,base.value_classes.FLOAT_PAIR,base.value_classes.VECTOR_VALUE,base.value_classes.PREDICATE_VALUE,base.value_classes.AGGREGATE,base.value_classes.COMPOUND_SCALABLE:)
 
 \subsection{Aggregate Passing}
 For every by-value aggregate argument, the caller allocates distinct storage,
@@ -457,8 +469,10 @@ The copy gives the callee an addressable object with the declared aggregate
 type. Modifications to the private copy remain isolated from the caller's
 source object. Baseline aggregates containing bit-fields and mixed
 integer/floating aggregates use the same INDIRECT rule; their member
-composition preserves the INDIRECT classification. An extension aggregate with
-packed or unaligned members is outside this ABI contract.
+composition preserves the INDIRECT classification. Passing or returning an
+aggregate with packed or unaligned members by value is outside the external
+calling contract. This restriction does not apply to an external packed object
+or to passing that object's address.
 
 \subsection{Variadic Calls}
 Fixed named arguments use the ordinary assignment procedure. Every unnamed
@@ -579,9 +593,10 @@ coordinate. Code and data pointers have the
 same size and alignment, while their distinct C type categories preserve
 separate code and data address spaces.
 
-A common symbol has the ABI alignment of its declared type. An external
-object retains its declared alignment up to the 16-byte aggregate maximum.
-An explicit extension owns stronger placement requirements.
+A common symbol has the ABI alignment of its declared type. An external object
+retains the effective alignment and layout of its declared type, including a
+supported packing annotation. Natural aggregate alignment is capped at 16
+bytes; an explicit extension owns stronger placement requirements.
 
 \subsection{Calls, Relocations, and Relaxation}
 The relocation records the linkage path selected for a C call:
@@ -623,11 +638,11 @@ Once the object satisfies the width and alignment requirements above, the
 compiler uses the following primitive lowering. The ordering sequences are
 defined separately below.
 
-\BedrockGeneratedCAtomicPrimitiveTable
+(:c-atomic-lowerings:base.atomic_lowerings.LOAD,base.atomic_lowerings.STORE,base.atomic_lowerings.COMPARE_EXCHANGE,base.atomic_lowerings.EXCHANGE:)
 
 \Needspace{2.6in}
 \subsection{C Atomic Memory Order Mapping}
-\BedrockGeneratedCMemoryOrderTable
+(:c-memory-orders:base.memory_orders.RELAXED,base.memory_orders.CONSUME,base.memory_orders.ACQUIRE,base.memory_orders.RELEASE,base.memory_orders.ACQ_REL,base.memory_orders.SEQ_CST:)
 
 For C compare-exchange, the compiler selects the join of the success and
 failure orders through the order lattice, independently of their numeric encodings. Consume is
@@ -651,7 +666,7 @@ patched instructions.
 
 \Needspace{2.0in}
 \subsection{C Fetch RMW Lowering}
-\BedrockGeneratedCFetchRMWTable
+(:c-atomic-lowerings:base.atomic_lowerings.FETCH_ADD,base.atomic_lowerings.FETCH_SUB,base.atomic_lowerings.FETCH_AND,base.atomic_lowerings.FETCH_OR,base.atomic_lowerings.FETCH_XOR:)
 
 \clearpage
 \section{Calling Convention Examples}\label{page:calling-convention-examples}

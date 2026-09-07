@@ -1,12 +1,14 @@
+from engine.isa.extensions import load_extension_inventory
 import tempfile
 import unittest
 from pathlib import Path
 
-from engine.extension import ExtensionMetadata, ExtensionSetCatalog
-from engine.model import (
+from engine.isa.extensions import ExtensionMetadata
+from engine.isa.model import (
     InvalidTopicStructureError,
     MissingModelManifestError,
     ModelCatalog,
+    load_model,
     ModelSourceOutsideOwnerError,
     ModelSourceOwnershipConflictError,
     SailDependencyCycleError,
@@ -60,9 +62,7 @@ class ModelCatalogTest(unittest.TestCase):
         (root / "model.yaml").write_text(text)
 
     def _load(self) -> ModelCatalog:
-        return ModelCatalog.load(
-            self.root, ExtensionSetCatalog.load(self.root), self.extensions
-        )
+        return load_model(self.root, load_extension_inventory(self.root))
 
     def test_sail_dependencies_and_document_topic_identity_are_independent(
         self,
@@ -165,7 +165,9 @@ class ModelCatalogTest(unittest.TestCase):
 
         with self.assertRaises(ModelSourceOutsideOwnerError) as caught:
             self._load()
-        self.assertEqual(caught.exception.manifest, (self.root / "model.yaml").resolve())
+        self.assertEqual(
+            caught.exception.manifest, (self.root / "model.yaml").resolve()
+        )
         self.assertEqual(caught.exception.owner, "base")
         self.assertEqual(
             caught.exception.source,
@@ -200,8 +202,7 @@ class ModelCatalogTest(unittest.TestCase):
         )
         self._manifest(
             "base",
-            "documents:\n  topics:\n  - id: topic\n"
-            "    source: documents/topic.tex\n",
+            "documents:\n  topics:\n  - id: topic\n    source: documents/topic.tex\n",
         )
 
         with self.assertRaises(InvalidTopicStructureError) as caught:

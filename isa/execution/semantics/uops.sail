@@ -237,6 +237,11 @@ function uop_memory_request_make(
             width = width,
             buffer_offset = 0,
         }|],
+        validation_ranges = [|struct {
+            effective_address = address.effective_address,
+            linear_address = address.linear_address,
+            width = width,
+        }|],
         read_completion = ReadCompletionData,
         memory_cache_hint = MemoryCacheDefault,
         commit_point = commit_point,
@@ -464,7 +469,11 @@ function uop_program_preserve_parent(next : Execution_result, previous : Executi
     }
 
 function uop_program_resume(previous : Execution_result, response : Transaction_response) -> Execution_result =
-    match (previous.pending.instruction, uop_continuation_get(previous.pending)) {
+    if previous.request.kind == Read
+       & byte_count(response.body_bytes) != previous.request.body_length then
+        faulted(previous.state, previous.pending.operation, InvalidControlState,
+                "memory read response length mismatch")
+    else match (previous.pending.instruction, uop_continuation_get(previous.pending)) {
         (Some(instruction), Some(continuation)) => {
             let response_value = if previous.request.kind == Read
                                  then memory_bytes_value(response.body_bytes, 0, 8)

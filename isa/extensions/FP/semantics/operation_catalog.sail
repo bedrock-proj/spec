@@ -160,7 +160,7 @@ function fp_conversion_form_result_policy(form : Catalog_entry, width : int)
   -> option(Fp_result_policy) =
   if fp_has_rn_write(form.operands) then Some(FpResultRn64)
   else if fp_has_ea_write(form.operands) then
-    if fp_size_list_is_integer(form.sizes) then Some(FpResultRn64)
+    if fp_size_list_is_integer(size_codes(form.sizes)) then Some(FpResultRn64)
     else Some(fp_memory_result(width))
   else Some(fp_fn_result(fp_conversion_fn_width(form.operation)))
 

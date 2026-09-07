@@ -1,3 +1,5 @@
+
+from engine.isa.terminology import load_terminology
 import shutil
 import tempfile
 import unittest
@@ -5,29 +7,29 @@ from pathlib import Path
 
 import yaml
 
-from engine.check import TerminologyValidator
-from engine.extension import ExtensionSetCatalog
+from engine.check import check_terminology
+from engine.isa.extensions import load_extension_inventory
 from engine.reference import Reference
-from engine.semantic_text import SemanticText
-from engine.terminology import TermCatalog
+from engine.syntax.semantic_text import SemanticText
+from engine.isa.terminology import TermCatalog
 
 
 class TermCatalogTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.isa_root = Path(__file__).parents[1] / "isa"
-        cls.catalog = TermCatalog.load(
-            cls.isa_root, ExtensionSetCatalog.load(cls.isa_root)
+        cls.catalog = load_terminology(
+            cls.isa_root, extensions=load_extension_inventory(cls.isa_root)
         )
 
     def test_projects_owner_local_terms_into_shared_reference_index(self) -> None:
         with self.fixture() as directory:
             root = Path(directory)
             self.write_sample_term(root)
-            catalog = TermCatalog.load(root, ExtensionSetCatalog.load(root))
+            catalog = load_terminology(root, extensions=load_extension_inventory(root))
 
-        group = catalog.references.groups[Reference.parse("base.term_groups.sample")]
-        term = catalog.references.terms[Reference.parse("base.terms.address")]
+        group = catalog.groups[Reference.parse("base.term_groups.sample")]
+        term = catalog.terms[Reference.parse("base.terms.address")]
         self.assertEqual(set(group.terms), {"address"})
         self.assertIs(group.terms["address"], term)
 
@@ -35,9 +37,9 @@ class TermCatalogTest(unittest.TestCase):
         with self.fixture() as directory:
             root = Path(directory)
             self.write_sample_term(root)
-            catalog = TermCatalog.load(root, ExtensionSetCatalog.load(root))
+            catalog = load_terminology(root, extensions=load_extension_inventory(root))
 
-        term = catalog.references.terms[Reference.parse("base.terms.address")]
+        term = catalog.terms[Reference.parse("base.terms.address")]
         self.assertIsInstance(term.definition, SemanticText)
         self.assertEqual(term.abbreviation.canonical, "SA")
         self.assertEqual(
@@ -69,8 +71,8 @@ class TermCatalogTest(unittest.TestCase):
                 },
             )
 
-            catalog = TermCatalog.load(root, ExtensionSetCatalog.load(root))
-            codes = [item.code for item in TerminologyValidator().validate(catalog)]
+            catalog = load_terminology(root, extensions=load_extension_inventory(root))
+            codes = [item.code for item in check_terminology(catalog)]
 
         self.assertEqual(codes, ["terminology.term.missing-directory"])
 
@@ -87,8 +89,8 @@ class TermCatalogTest(unittest.TestCase):
                 },
             )
 
-            catalog = TermCatalog.load(root, ExtensionSetCatalog.load(root))
-            codes = [item.code for item in TerminologyValidator().validate(catalog)]
+            catalog = load_terminology(root, extensions=load_extension_inventory(root))
+            codes = [item.code for item in check_terminology(catalog)]
 
         self.assertEqual(codes, ["terminology.definition.unknown-term"])
 
@@ -110,8 +112,8 @@ class TermCatalogTest(unittest.TestCase):
                     },
                 )
 
-            catalog = TermCatalog.load(root, ExtensionSetCatalog.load(root))
-            codes = [item.code for item in TerminologyValidator().validate(catalog)]
+            catalog = load_terminology(root, extensions=load_extension_inventory(root))
+            codes = [item.code for item in check_terminology(catalog)]
 
         self.assertEqual(codes, ["terminology.spelling.conflict"])
 
@@ -130,8 +132,8 @@ class TermCatalogTest(unittest.TestCase):
                     },
                 )
 
-            catalog = TermCatalog.load(root, ExtensionSetCatalog.load(root))
-            codes = [item.code for item in TerminologyValidator().validate(catalog)]
+            catalog = load_terminology(root, extensions=load_extension_inventory(root))
+            codes = [item.code for item in check_terminology(catalog)]
 
         self.assertEqual(codes, ["terminology.relation.broader-cycle"])
 

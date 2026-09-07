@@ -38,6 +38,11 @@ function uop_stack_request_make(
             width = unsigned(sub_bits(range_end, address)),
             buffer_offset = 0,
         }|],
+        validation_ranges = [|struct {
+            effective_address = address,
+            linear_address = point.linear,
+            width = unsigned(sub_bits(range_end, address)),
+        }|],
         read_completion = ReadCompletionData,
         memory_cache_hint = MemoryCacheDefault,
         commit_point = commit_point,

@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 
 from engine.reference import Reference
-from engine.semantic_text import (
+from engine.syntax.semantic_text import (
     EntityReferenceText,
     LiteralText,
     SemanticText,

@@ -1,32 +1,38 @@
-import unittest
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import unittest
+from pathlib import Path
 
-from engine.generation import ArtifactGenerationContext, ArtifactGeneratorRegistry
-from engine.project import IsaProject
-from engine.workspace import SpecWorkspace
+from engine.isa.architecture import cpuid_project
+from engine.isa.architecture import event_codec_project
+from engine.isa.event_structures import resolve_event_frame_layouts
+from engine.isa.architecture import register_contracts_project
+from engine.isa.architecture import vector_geometry_project
+from engine.artifacts.generate import artifact_context, generate_artifact
+from engine.artifacts.registry import ArtifactGeneratorRegistry, load_artifact_registry
+from engine.isa.project import IsaProject
+from engine.workspace import load_workspace
 
 
 class SystemVerilogArchitectureArtifactsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.repository = Path(__file__).parents[1]
-        cls.workspace = SpecWorkspace.load(cls.repository)
-        cls.registry = ArtifactGeneratorRegistry.discover(cls.workspace)
+        cls.workspace = load_workspace(cls.repository)
+        cls.registry = load_artifact_registry(cls.workspace)
         project = cls.workspace.require_provider("isa")
         if not isinstance(project, IsaProject):
             raise TypeError("workspace isa provider must be an IsaProject")
         cls.project = project
-        cls.context = ArtifactGenerationContext.create(
-            cls.workspace, cls.repository / "output"
+        cls.context = artifact_context(
+            load_artifact_registry(cls.workspace),
+            cls.workspace,
+            cls.repository / "output",
         )
 
     def test_cpuid_projection_owns_queries_fields_and_masks(self) -> None:
-        projection = self.registry.generator("systemverilog-cpuid").project(
-            self.context
-        )
+        projection = cpuid_project(self.project.cpuid)
         expected_queries = {
             (owner, cpuid_class.id, leaf.id, query.id)
             for owner, namespace in self.project.cpuid.namespaces.items()
@@ -38,20 +44,18 @@ class SystemVerilogArchitectureArtifactsTest(unittest.TestCase):
         self.assertEqual(
             {
                 (query.owner, query.class_id, query.leaf_id, query.query_id)
-                for query in projection.queries
+                for query in projection
             },
             expected_queries,
         )
-        for query in projection.queries:
+        for query in projection:
             self.assertLessEqual(query.first_index, query.last_index)
             self.assertGreater(query.stride, 0)
             for field in query.fields:
                 self.assertEqual(field.mask, ((1 << field.bits) - 1) << field.lsb)
 
     def test_event_projection_owns_fixed_and_dynamic_routes(self) -> None:
-        projection = self.registry.generator("systemverilog-event-codec").project(
-            self.context
-        )
+        projection = event_codec_project(self.project.events, resolve_event_frame_layouts(self.project.event_frames.frame))
         resolved = self.project.events.resolved_events()
         expected_fixed = {
             (item.owner, item.event.id, item.code.value, item.event.frame)
@@ -66,20 +70,20 @@ class SystemVerilogArchitectureArtifactsTest(unittest.TestCase):
 
         self.assertEqual(
             {
-                (route.owner, route.event_id, route.code, route.frame)
+                (route.owner, route.event_id, route.code, route.frame.frame_type)
                 for route in projection.fixed_routes
             },
             expected_fixed,
         )
         self.assertEqual(
-            {(route.class_value, route.frame) for route in projection.dynamic_routes},
+            {(route.class_value, route.frame.frame_type) for route in projection.dynamic_routes},
             expected_dynamic,
         )
 
     def test_register_projection_owns_selectors_and_write_masks(self) -> None:
-        projection = self.registry.generator(
-            "systemverilog-register-contracts"
-        ).project(self.context)
+        projection = register_contracts_project(
+            self.project.registers, self.project.control_registers
+        )
         expected = {}
         for owner, namespace in self.project.registers.namespaces.items():
             for group in namespace.groups.values():
@@ -88,40 +92,49 @@ class SystemVerilogArchitectureArtifactsTest(unittest.TestCase):
                         continue
                     expected[(owner, group.id, register.id)] = (
                         register.encoding,
-                        (1 << 64) - 1
-                        if register.layout is None
-                        else sum(
-                            ((1 << field.bits) - 1) << field.lsb
-                            for field in register.layout.fields
+                        (
+                            (1 << 64) - 1
+                            if register.layout is None
+                            else sum(
+                                ((1 << field.bits) - 1) << field.lsb
+                                for field in register.layout.fields
+                            )
                         ),
                     )
         for owner, namespace in self.project.control_registers.namespaces.items():
             for register in namespace.registers.values():
                 expected[(owner, "CONTROL_REGISTERS", register.id)] = (
                     register.selector,
-                    (1 << 64) - 1
-                    if register.layout is None
-                    else sum(
-                        ((1 << field.bits) - 1) << field.lsb
-                        for field in register.layout.fields
+                    (
+                        (1 << 64) - 1
+                        if register.layout is None
+                        else sum(
+                            ((1 << field.bits) - 1) << field.lsb
+                            for field in register.layout.fields
+                        )
                     ),
                 )
 
         self.assertEqual(
             {
-                (register.owner, register.group_id, register.register_id): (
+                (owner, group, register.register_id): (
                     register.encoding,
                     register.writable_mask,
                 )
-                for register in projection.registers
+                for (owner, group), registers in {
+                    **projection.groups,
+                    **{
+                        (owner, "CONTROL_REGISTERS"): registers
+                        for owner, registers in projection.control_registers.items()
+                    },
+                }.items()
+                for register in registers
             },
             expected,
         )
 
     def test_vector_projection_owns_architectural_register_counts(self) -> None:
-        projection = self.registry.generator("systemverilog-vector-geometry").project(
-            self.context
-        )
+        projection = vector_geometry_project(self.project.registers)
         namespace = self.project.registers.namespaces["VECTOR"]
 
         self.assertEqual(
@@ -144,10 +157,13 @@ class SystemVerilogArchitectureArtifactsTest(unittest.TestCase):
             "systemverilog-register-contracts",
             "systemverilog-vector-geometry",
         ):
-            with self.subTest(artifact=artifact_id), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(artifact=artifact_id),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
-                generated = self.registry.generate(
-                    artifact_id, self.workspace, root
+                generated = generate_artifact(
+                    self.registry, artifact_id, self.workspace, root
                 )
                 sources = []
                 for artifact in generated.artifacts:
@@ -172,6 +188,7 @@ class SystemVerilogArchitectureArtifactsTest(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(completed.returncode, 0, completed.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

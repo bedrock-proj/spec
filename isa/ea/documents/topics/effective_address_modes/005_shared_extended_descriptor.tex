@@ -1,13 +1,18 @@
 \subsection{Shared Extended Descriptor}
-A compact EXT1 or EXT2 value in any profile selects both an exact descriptor length and the displacement width. The descriptor
-bytes then select segment, base, index, zero-base, SP/PC indexed, and auto-update behavior within that family.
+A compact extension form selects a descriptor family and its exact byte length. The descriptor bytes select an EA mode
+within that family. For EXT1 and EXT2, the compact form also selects the displacement width.
+Only compact forms select extensions; an extended descriptor cannot select another extension.
+Field roles are unique across the compact form and its descriptor; payload roles are likewise unique across their selected encoding variants.
+Auto-updates declared by either selected encoding are retained. If both encodings declare an auto-update,
+their distinct base and index roles are evaluated in base-before-index order, regardless of which encoding declares each role.
 
-Each extended descriptor selects its segment from the encoded SREG (:term:base.terms.field:) SEG(s), the fixed SS segment for SP, the fixed CS
+An extended memory mode selects its segment from the encoded SREG (:term:base.terms.field:) SEG(s), the fixed SS segment for SP, the fixed CS
 segment for PC, or the operation\textquotesingle{}s default data segment.
 
 For a compact displacement, absolute address, or immediate, the selected (:term:base.terms.payload:) follows the compact (:term:base.terms.field:) at that
 operand\textquotesingle{}s (:term:base.terms.payload:) position. Extended-descriptor construction begins with the compact escape value in the (:term:base.terms.opcode:)
-space and exactly one EXT1 or two EXT2 descriptor bytes; a displaced form places its selected displacement after
+space and the descriptor bytes declared by that compact form. EXT1 declares one byte and EXT2 declares two bytes.
+A displaced form places its selected displacement after
 all extended descriptor bytes in the instruction. When an instruction has more than one extended EA operand, the decoder consumes
 their complete descriptors in declared instruction operand order. It then consumes every remaining appended EA (:term:base.terms.payload:),
 including any selected displacement, in declared instruction operand order.

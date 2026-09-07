@@ -1,20 +1,24 @@
 import unittest
 from pathlib import Path
 
-from engine.encoding_space import (
-    CandidateOutsideNamespaceError,
-    EncodingCube,
-    EncodingSpaceAnalyzer,
-    EncodingSpaceEntry,
-    unavailable_cubes,
-)
-from engine.encoding_architecture import (
+from engine.isa.encoding_space import CandidateOutsideNamespaceError
+from engine.isa.encoding_space import EncodingCube
+from engine.isa.encoding_space import analyze_encoding_space
+from engine.isa.encoding_space import entries_encoding_space
+from engine.isa.encoding_space import summaries_encoding_space
+from engine.isa.encoding_space import holes_encoding_space
+from engine.isa.encoding_space import check_candidate_encoding_space
+from engine.isa.encoding_space import EncodingSpaceEntry
+from engine.isa.encoding_space import unavailable_cubes
+from engine.isa.encoding import resolve_encoding_form
+from engine.isa.encoding_reservations import reservation_cubes
+from engine.isa.encoding_architecture import (
     ENCODING_CLASSES,
     OperatorSpaceUnavailableError,
     encoding_class,
     operator_space,
 )
-from engine.project import IsaProject
+from engine.isa.project import load_isa
 from engine.reference import Reference
 
 
@@ -30,10 +34,9 @@ class EncodingArchitectureTest(unittest.TestCase):
                 "1110??????????????",
             ),
         )
+
     def test_operator_spaces_are_scoped_by_class(self) -> None:
-        self.assertEqual(
-            operator_space("extralong", "vector").prefix, "11111101??"
-        )
+        self.assertEqual(operator_space("extralong", "vector").prefix, "11111101??")
         with self.assertRaises(OperatorSpaceUnavailableError):
             operator_space("long", "vector")
 
@@ -48,25 +51,33 @@ class EncodingCubeTest(unittest.TestCase):
         self.assertEqual(prefix.intersection(subset), subset)
 
 
-class EncodingSpaceAnalyzerTest(unittest.TestCase):
+class EncodingSpaceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.isa_root = Path(__file__).parents[1] / "isa"
-        cls.project = IsaProject.load(cls.isa_root)
-        cls.analyzer = EncodingSpaceAnalyzer()
-        cls.entries = cls.analyzer.entries(cls.project)
+        cls.project = load_isa(cls.isa_root)
+        cls.forms = tuple(
+            (bundle.reference, bundle.encodings.source, resolve_encoding_form(
+                bundle.instruction, form, field_types=cls.project.types.field_types,
+                payload_types=cls.project.types.payload_types,
+                ea_modes=cls.project.catalog.ea_modes, registers=cls.project.registers,
+            ))
+            for bundle in cls.project.catalog.select() for form in bundle.encodings.forms
+        )
+        cls.reservations = reservation_cubes(cls.project.encoding_reservations)
+        cls.entries = entries_encoding_space(cls.forms)
 
     def test_complete_map_contains_every_form_without_collisions(self) -> None:
-        analysis = self.analyzer.analyze(self.project)
+        analysis = analyze_encoding_space(self.forms)
         form_count = sum(
-            len(bundle.encodings.forms) for bundle in self.project.select()
+            len(bundle.encodings.forms) for bundle in self.project.catalog.select()
         )
 
         self.assertEqual(len(analysis.entries), form_count)
         self.assertEqual(analysis.collisions, ())
 
     def test_summary_partitions_assigned_reclaimed_reserved_and_free(self) -> None:
-        summaries = self.analyzer.summaries(self.project)
+        summaries = summaries_encoding_space(self.forms, reservations=self.reservations)
 
         by_class = {item.encoding_class: item for item in summaries}
         self.assertEqual(set(by_class), {item.name for item in ENCODING_CLASSES})
@@ -84,11 +95,11 @@ class EncodingSpaceAnalyzerTest(unittest.TestCase):
             )
 
     def test_entries_can_be_scoped_to_named_operator_space(self) -> None:
-        entries = self.analyzer.entries(self.project, "extralong", space="vector")
+        entries = entries_encoding_space(self.forms, "extralong", space="vector")
         self.assertTrue(entries)
         selected_mnemonic = entries[0].mnemonic
-        filtered = self.analyzer.entries(
-            self.project, "extralong", space="vector", grep=selected_mnemonic
+        filtered = entries_encoding_space(
+            self.forms, "extralong", space="vector", grep=selected_mnemonic
         )
         self.assertEqual(
             filtered,
@@ -97,7 +108,7 @@ class EncodingSpaceAnalyzerTest(unittest.TestCase):
 
     def test_candidate_outside_class_namespace_is_rejected(self) -> None:
         with self.assertRaises(CandidateOutsideNamespaceError) as caught:
-            self.analyzer.check_candidate(self.project, "xxlong", "0000")
+            check_candidate_encoding_space(self.forms, "xxlong", "0000", reservations=self.reservations)
 
         self.assertEqual(caught.exception.encoding_class, "xxlong")
         self.assertEqual(caught.exception.pattern, "0000" + "?" * 38)
@@ -127,9 +138,10 @@ class EncodingSpaceAnalyzerTest(unittest.TestCase):
         )
 
     def test_holes_stay_inside_operator_space_and_avoid_raw_reservations(self) -> None:
-        holes = self.analyzer.holes(
-            self.project,
+        holes = holes_encoding_space(
+            self.forms,
             "xxlong",
+            reservations=self.reservations,
             space="vector",
             min_slots=16,
             limit=5,
@@ -150,6 +162,7 @@ class EncodingSpaceAnalyzerTest(unittest.TestCase):
         for hole in holes:
             self.assertTrue(scope.contains(hole.cube))
             self.assertFalse(any(hole.cube.overlaps(cube) for cube in raw))
+
 
 if __name__ == "__main__":
     unittest.main()

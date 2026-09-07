@@ -2,17 +2,10 @@ function clause register_result_extension(Op_RDVSTATUS) = RegisterZeroExtend
 
 function clause repeat_semantics(Op_RDVSTATUS) = RepeatObserveDestination
 
-function lower_RDVSTATUS_uops(instruction : Decoded_instruction) -> option(list(Uop)) =
-    Some([|
+function execute_RDVSTATUS(instruction : Decoded_instruction, state : Cpu_state) -> option(Execution_result) =
+    Some(uop_program_execute([|
         uop_make(UopVectorStateRead(), uop_location_make_none(), uop_location_make_none(),
                  uop_location_make_none(), Operand_dst, operation_width(instruction), CommitRegisters),
         uop_make(UopCommit(), uop_location_make_none(), uop_location_make_none(),
                  uop_location_make_none(), Operand_dst, operation_width(instruction), CommitRegisters),
-    |])
-
-function execute_RDVSTATUS(instruction : Decoded_instruction, state : Cpu_state) -> option(Execution_result) =
-    match lower_RDVSTATUS_uops(instruction) {
-        Some(program) => Some(uop_program_execute(program, instruction, state)),
-        None() => Some(faulted(state, instruction.form.operation, IllegalInstruction,
-                               "RDVSTATUS could not be lowered to micro-operations")),
-    }
+    |], instruction, state))

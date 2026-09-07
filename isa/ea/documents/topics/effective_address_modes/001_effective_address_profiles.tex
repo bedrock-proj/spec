@@ -19,9 +19,10 @@ For two payload-bearing operands, the encoded stream contains the (:term:base.te
 operand 0, any extended descriptor for operand 1, the remaining operand 0 (:term:base.terms.payload|plural:), the remaining operand 1
 (:term:base.terms.payload|plural:), and any trailing (:term:base.terms.padding:), in that order.
 
-Multi-byte (:term:base.terms.payload|plural:), such as displacements, absolute addresses, and immediates, are little-endian. Payload
-names ending in s are signed and are sign-extended before use; (:term:base.terms.payload:) names without s are unsigned unless the
-consuming instruction explicitly says otherwise. Extended descriptor bytes appear in stream order, byte 0 first. Each
+Multi-byte (:term:base.terms.payload|plural:), such as displacements, absolute addresses, and immediates, are little-endian.
+The payload type declaration determines signedness: address payloads declare \texttt{signed}, and integer immediates declare
+\texttt{signed_integer} or \texttt{unsigned_integer}. Signed payloads are sign-extended before use. The consuming instruction
+determines any further interpretation of the value. Extended descriptor bytes appear in stream order, byte 0 first. Each
 descriptor byte is independently numbered from bit 7 through bit 0.
 
 Indexed scale is the EA interpretation width declared by the consuming instruction encoding. B, W, L, and Q widths select scales 1,

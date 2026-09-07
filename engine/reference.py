@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-import re
+from types import MappingProxyType
 from typing import Generic, TypeVar
-
 
 _OWNER_RE = re.compile(r"base|[A-Z][A-Z0-9_]*")
 _SEGMENT_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
@@ -47,9 +47,7 @@ class Reference(Generic[_T_co]):
                 raise ReferenceError(f"invalid reference segment {segment!r}")
 
     @classmethod
-    def parse(
-        cls, value: str | "Reference[_T_co]"
-    ) -> "Reference[_T_co]":
+    def parse(cls, value: str | "Reference[_T_co]") -> "Reference[_T_co]":
         """Parse a dotted reference, returning existing references unchanged."""
 
         if isinstance(value, cls):
@@ -109,34 +107,32 @@ class QualifiedReference(Generic[_T_co]):
         raise TypeError("QualifiedReference does not provide a string representation")
 
 
+@dataclass(frozen=True, slots=True, eq=False)
 class ReferenceIndex(Mapping[Reference[_T], _T], Generic[_T]):
     """A filesystem-independent mapping from logical references to values."""
 
-    def __init__(self) -> None:
-        self._entries: dict[Reference[_T], _T] = {}
+    _entries: Mapping[Reference[_T], _T]
 
-    def register(self, reference: Reference[_T], value: _T) -> Reference[_T]:
-        """Register ``value`` and return its reference."""
 
-        if not isinstance(reference, Reference):
-            raise ReferenceError("reference index registration requires a Reference")
-        if reference in self._entries:
-            raise DuplicateReferenceError("duplicate reference")
-        self._entries[reference] = value
-        return reference
+    def __init__(
+        self, entries: Mapping[Reference[_T], _T] = MappingProxyType({})
+    ) -> None:
+        values = dict(entries)
+        if any(not isinstance(reference, Reference) for reference in values):
+            raise ReferenceError("reference index keys must be Reference values")
+        object.__setattr__(self, "_entries", MappingProxyType(values))
 
     def resolve(self, reference: Reference[_T]) -> _T:
         """Resolve a logical reference or raise ``UnknownReferenceError``."""
 
-        if not isinstance(reference, Reference):
-            raise ReferenceError("reference index resolution requires a Reference")
-        try:
-            return self._entries[reference]
-        except KeyError as error:
-            raise UnknownReferenceError("unknown reference") from error
+        return resolve_reference(self._entries, reference)
 
     def __getitem__(self, reference: Reference[_T]) -> _T:
-        return self.resolve(reference)
+        """Look up a mapping key, raising ``KeyError`` if it is absent."""
+
+        if not isinstance(reference, Reference):
+            raise ReferenceError("reference index lookup requires a Reference")
+        return self._entries[reference]
 
     def __contains__(self, reference: object) -> bool:
         if not isinstance(reference, Reference):
@@ -148,3 +144,26 @@ class ReferenceIndex(Mapping[Reference[_T], _T], Generic[_T]):
 
     def __len__(self) -> int:
         return len(self._entries)
+
+
+def register_reference(
+    entries: dict[Reference[_T], _T], reference: Reference[_T], value: _T
+) -> Reference[_T]:
+    """Add a unique reference while constructing an owner-local index."""
+    if not isinstance(reference, Reference):
+        raise ReferenceError("reference index registration requires a Reference")
+    if reference in entries:
+        raise DuplicateReferenceError("duplicate reference")
+    entries[reference] = value
+    return reference
+
+
+def resolve_reference(
+    entries: Mapping[Reference[_T], _T], reference: Reference[_T]
+) -> _T:
+    if not isinstance(reference, Reference):
+        raise ReferenceError("reference index resolution requires a Reference")
+    try:
+        return entries[reference]
+    except KeyError as error:
+        raise UnknownReferenceError("unknown reference") from error

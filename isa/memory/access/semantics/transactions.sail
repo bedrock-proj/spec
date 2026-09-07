@@ -34,6 +34,11 @@ function request_for_evaluation(kind : Primitive_request_kind, ordinal : int,
     width = evaluation.width,
     buffer_offset = 0
   }|],
+  validation_ranges = [|struct {
+    effective_address = evaluation.effective_address,
+    linear_address = evaluation.linear_address,
+    width = evaluation.width,
+  }|],
   read_completion = ReadCompletionData, memory_cache_hint = MemoryCacheDefault,
   commit_point = commit_point,
   memory_order = ordinal, cache_policy = 0, suppress_fault = false,

@@ -6,19 +6,35 @@ import argparse
 import json
 import logging
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Sequence
 
-from .encoding_space import CandidateOutsideNamespaceError, EncodingSpaceAnalyzer
-from .check import WorkspaceCheckService
-from .diagnostics import Diagnostic, DiagnosticBag, Severity
-from .document import DocumentBuilder
-from .generation import ArtifactGeneratorRegistry, ArtifactWriter
-from .observability import configure_logging, log_caught_exception, log_phase
-from .project import IsaProject, ProjectLookupError
-from .workspace import SpecWorkspace
-
+from engine.artifacts.generate import artifact_context
+from engine.artifacts.registry import ArtifactGeneratorRegistry, load_artifact_registry
+from engine.artifacts.write import write_artifacts
+from engine.check import check_workspace
+from engine.diagnostics import (
+    Diagnostic,
+    DiagnosticBag,
+    Severity,
+    render_diagnostics_json,
+    render_diagnostics_text,
+)
+from engine.isa.encoding import resolve_encoding_form
+from engine.isa.encoding_reservations import EncodingReservationError
+from engine.isa.encoding_reservations import reservation_cubes
+from engine.isa.encoding_space import (
+    CandidateOutsideNamespaceError,
+    check_candidate_encoding_space,
+    entries_encoding_space,
+    holes_encoding_space,
+    summaries_encoding_space,
+)
+from engine.isa.project import IsaProject
+from engine.isa.catalog import ProjectLookupError
+from engine.observability import configure_logging, log_caught_exception, log_phase
+from engine.workspace import SpecWorkspace, load_workspace
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,7 +59,9 @@ def _parser() -> argparse.ArgumentParser:
         help="report detailed phases and caught exception tracebacks on stderr",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    check = subparsers.add_parser("check", help="validate authored specification sources")
+    check = subparsers.add_parser(
+        "check", help="validate authored specification sources"
+    )
     check.add_argument(
         "targets", nargs="*", help="instruction names, references, or paths"
     )
@@ -137,6 +155,8 @@ def _add_encoding_space_scope(parser: argparse.ArgumentParser) -> None:
 
 
 def _load_failure(root: Path, error: Exception) -> DiagnosticBag:
+    if isinstance(error, EncodingReservationError):
+        return error.diagnostics
     if isinstance(error, ProjectLookupError):
         code = f"project.lookup.{error.reason.value.replace('_', '-')}"
     elif isinstance(error, CandidateOutsideNamespaceError):
@@ -159,7 +179,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     configure_logging(verbose=args.verbose, debug=args.debug, stream=sys.stderr)
     try:
-        workspace = SpecWorkspace.load(args.isa_root.resolve().parent)
+        workspace = load_workspace(args.isa_root.resolve().parent)
         provider = workspace.require_provider("isa")
         if not isinstance(provider, IsaProject):
             raise TypeError("workspace isa provider must be an IsaProject")
@@ -189,7 +209,7 @@ def _run_check(
     project: IsaProject,
 ) -> int:
     try:
-        diagnostics = WorkspaceCheckService().check(workspace, args.targets)
+        diagnostics = check_workspace(workspace, args.targets)
     except (OSError, ValueError) as error:
         log_caught_exception(_LOGGER, "check", error)
         diagnostics = _load_failure(args.isa_root, error)
@@ -197,7 +217,7 @@ def _run_check(
     if diagnostics or args.output_format == "json":
         _emit_diagnostics(args, diagnostics)
     else:
-        selected = project.select(args.targets)
+        selected = project.catalog.select(args.targets)
         instruction_count = len(selected)
         form_count = sum(len(bundle.encodings.forms) for bundle in selected)
         instruction_label = "instruction" if instruction_count == 1 else "instructions"
@@ -212,25 +232,26 @@ def _run_check(
 def _emit_diagnostics(args: argparse.Namespace, diagnostics: DiagnosticBag) -> None:
     output_format = getattr(args, "output_format", "text")
     if output_format == "json":
-        print(diagnostics.render_json())
+        print(render_diagnostics_json(diagnostics))
         return
-    rendered = diagnostics.render_text()
+    rendered = render_diagnostics_text(diagnostics)
     if rendered:
         print(rendered, file=sys.stderr if diagnostics.has_errors else sys.stdout)
 
 
 def _run_docs(args: argparse.Namespace, workspace: SpecWorkspace) -> int:
     try:
-        registry = ArtifactGeneratorRegistry.discover(workspace)
+        registry = load_artifact_registry(workspace)
         generators = tuple(
-            registry.generator(artifact_id)
+            registry.definition(artifact_id)
             for artifact_id in registry.artifact_ids
-            if "document" in registry.generator(artifact_id).definition.outputs
+            if "document" in registry.definition(artifact_id).outputs
         )
+        context = artifact_context(registry, workspace, args.output_root)
         results = tuple(
-            DocumentBuilder(generator=generator).build(
-                workspace,
-                args.output_root,
+            registry.entrypoint(generator.id, "build")(
+                generator,
+                context,
                 compile_pdf=args.action == "build",
                 latexmk=args.latexmk,
             )
@@ -242,7 +263,7 @@ def _run_docs(args: argparse.Namespace, workspace: SpecWorkspace) -> int:
         return 1
     for generator, result in zip(generators, results, strict=True):
         print(
-            f"{generator.artifact_id} TeX validation: "
+            f"{generator.id} TeX validation: "
             f"{'passed' if result.report.passed else 'failed'}"
         )
         print(f"TeX: {result.tex}")
@@ -255,17 +276,18 @@ def _run_docs(args: argparse.Namespace, workspace: SpecWorkspace) -> int:
 
 def _run_artifacts(args: argparse.Namespace, workspace: SpecWorkspace) -> int:
     try:
-        registry = ArtifactGeneratorRegistry.discover(workspace)
+        registry = load_artifact_registry(workspace)
         if args.action == "list":
             for artifact_id in registry.artifact_ids:
-                generator = registry.generator(artifact_id)
-                print(f"{artifact_id}\t{generator.definition.source}")
+                generator = registry.definition(artifact_id)
+                print(f"{artifact_id}\t{generator.source}")
             return 0
         selected = tuple(args.artifact_ids) or registry.artifact_ids
-        writer = ArtifactWriter()
+        context = artifact_context(registry, workspace, args.output_root)
+        writer = write_artifacts
         for artifact_id in selected:
-            artifacts = registry.generate(artifact_id, workspace, args.output_root)
-            written = writer.write(artifacts, args.output_root)
+            artifacts = context.generate(artifact_id, None)
+            written = writer(artifacts, args.output_root)
             print(f"generated {artifact_id}:")
             for path in written:
                 print(f"  {path}")
@@ -277,10 +299,20 @@ def _run_artifacts(args: argparse.Namespace, workspace: SpecWorkspace) -> int:
 
 
 def _run_encoding_space(args: argparse.Namespace, project: IsaProject) -> int:
-    analyzer = EncodingSpaceAnalyzer()
     try:
+        forms = tuple(
+            (bundle.reference, bundle.encodings.source, resolve_encoding_form(
+                bundle.instruction, form,
+                field_types=project.types.field_types,
+                payload_types=project.types.payload_types,
+                ea_modes=project.catalog.ea_modes,
+                registers=project.registers,
+            ))
+            for bundle in project.catalog.select() for form in bundle.encodings.forms
+        )
+        reservations = reservation_cubes(project.encoding_reservations)
         if args.encoding_space_command == "summary":
-            summaries = analyzer.summaries(project)
+            summaries = summaries_encoding_space(forms, reservations=reservations)
             if args.output_format == "json":
                 print(
                     json.dumps(
@@ -302,7 +334,9 @@ def _run_encoding_space(args: argparse.Namespace, project: IsaProject) -> int:
                     )
                 )
             else:
-                print("class       bits  forms       namespace        assigned       reclaimed        reserved      clean-free       remaining")
+                print(
+                    "class       bits  forms       namespace        assigned       reclaimed        reserved      clean-free       remaining"
+                )
                 for item in summaries:
                     print(
                         f"{item.encoding_class:<11}{item.width:>4}{item.forms:>7}"
@@ -314,8 +348,8 @@ def _run_encoding_space(args: argparse.Namespace, project: IsaProject) -> int:
             return 0
 
         if args.encoding_space_command == "entries":
-            entries = analyzer.entries(
-                project,
+            entries = entries_encoding_space(
+                forms,
                 args.encoding_class,
                 space=args.space,
                 leading=args.leading,
@@ -349,10 +383,11 @@ def _run_encoding_space(args: argparse.Namespace, project: IsaProject) -> int:
             return 0
 
         if args.encoding_space_command == "check":
-            result = analyzer.check_candidate(
-                project,
+            result = check_candidate_encoding_space(
+                forms,
                 args.encoding_class,
                 args.pattern,
+                reservations=reservations,
                 space=args.space,
             )
             if args.output_format == "json":
@@ -373,9 +408,7 @@ def _run_encoding_space(args: argparse.Namespace, project: IsaProject) -> int:
                             "reclaimed_entries": [
                                 entry.name for entry in result.reclaimed_entries
                             ],
-                            "reservations": [
-                                reservation.id for reservation in result.reservations
-                            ],
+                            "reservations": list(result.reservations),
                         },
                         indent=2,
                     )
@@ -399,13 +432,15 @@ def _run_encoding_space(args: argparse.Namespace, project: IsaProject) -> int:
                         print(f"  {entry.name}  {entry.pattern}")
                 if result.reservations:
                     print("reservation overlaps:")
-                    for reservation in result.reservations:
-                        print(f"  {reservation.id}  {reservation.summary}")
+                    for name in result.reservations:
+                        reservation = project.encoding_reservations.reservations[name]
+                        print(f"  {name}  {reservation.summary}")
             return 1 if result.assigned_slots or result.reserved_slots else 0
 
-        holes = analyzer.holes(
-            project,
+        holes = holes_encoding_space(
+            forms,
             args.encoding_class,
+            reservations=reservations,
             space=args.space,
             leading=args.leading,
             include_reclaimed=args.include_reclaimed,

@@ -1,11 +1,14 @@
+
+from engine.documents.fragments.memory_records import project_record_layout
+from engine.isa.memory_records import load_memory_records
+from engine.isa.extensions import load_extension_inventory
 import shutil
 import tempfile
 import unittest
-from fractions import Fraction
 from pathlib import Path
 
-from engine.memory_record import MemoryRecordCatalog, MemoryRecordError
-from engine.render.memory_record import MemoryRecordProjection
+from engine.isa.memory_records import MemoryRecordCatalog, MemoryRecordError
+from engine.documents.fragments.memory_records import MemoryRecordProjection
 
 
 class MemoryRecordCatalogTest(unittest.TestCase):
@@ -13,36 +16,27 @@ class MemoryRecordCatalogTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.isa_root = Path(__file__).parents[1] / "isa"
 
-    def test_derives_layout_and_display_height_from_ordered_components(self) -> None:
+    def test_component_offsets_and_padding_follow_declared_sizes(self) -> None:
         with self.fixture() as directory:
-            catalog = MemoryRecordCatalog.load(directory)
+            catalog = load_memory_records(directory, extensions=load_extension_inventory(directory))
             record = catalog.resolve("base.records.SAMPLE")
-            projection = MemoryRecordProjection.create(record)
+            projection = project_record_layout(record)
 
             self.assertEqual(record.payload_bytes(8), 16)
             self.assertEqual(record.total_bytes(8), 16)
             self.assertEqual(record.payload_bytes(16), 28)
             self.assertEqual(record.total_bytes(16), 32)
             self.assertEqual(projection.components[1].offset.constant, 4)
-            self.assertEqual(
-                tuple(row.index for row in projection.components[1].rows),
-                (0, 1, None, 4, 5),
-            )
-            self.assertEqual(
-                tuple(row.height for row in projection.components[1].rows),
-                (Fraction(1),) * 5,
-            )
             self.assertIsNotNone(projection.padding)
             assert projection.padding is not None
             self.assertEqual(projection.padding.values, (0, 4))
-            self.assertEqual(projection.padding.height, 1)
 
     def test_rejects_undeclared_member_directory(self) -> None:
         with self.fixture() as directory:
             (Path(directory) / "records/EXTRA").mkdir()
 
             with self.assertRaises(ValueError):
-                MemoryRecordCatalog.load(directory)
+                load_memory_records(directory, extensions=load_extension_inventory(directory))
 
     def test_rejects_symbolic_size_that_is_not_whole_bytes(self) -> None:
         with self.fixture() as directory:
@@ -53,7 +47,7 @@ class MemoryRecordCatalogTest(unittest.TestCase):
             )
 
             with self.assertRaises(MemoryRecordError):
-                MemoryRecordCatalog.load(directory)
+                load_memory_records(directory, extensions=load_extension_inventory(directory))
 
     def test_rejects_overlapping_stored_bit_fields(self) -> None:
         with self.fixture() as directory:
@@ -71,7 +65,7 @@ class MemoryRecordCatalogTest(unittest.TestCase):
             )
 
             with self.assertRaises(MemoryRecordError):
-                MemoryRecordCatalog.load(directory)
+                load_memory_records(directory, extensions=load_extension_inventory(directory))
 
     def test_rejects_stored_bit_field_outside_component(self) -> None:
         with self.fixture() as directory:
@@ -82,7 +76,7 @@ class MemoryRecordCatalogTest(unittest.TestCase):
             )
 
             with self.assertRaises(MemoryRecordError):
-                MemoryRecordCatalog.load(directory)
+                load_memory_records(directory, extensions=load_extension_inventory(directory))
 
     @property
     def record_source(self) -> str:

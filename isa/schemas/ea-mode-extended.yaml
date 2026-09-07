@@ -3,15 +3,13 @@ $id: bedrock://schemas/ea-mode-extended
 title: Bedrock extended effective-address mode
 type: object
 additionalProperties: false
-required: [name, kind, encodings, syntax]
+required: [name, kind, encodings, syntax, pseudocode]
 properties:
   name:
     type: string
     minLength: 1
   kind:
-    enum: [immediate, memory, extension]
-  extension:
-    $ref: '#/$defs/extension'
+    enum: [immediate, memory]
   encodings:
     type: array
     minItems: 1
@@ -37,19 +35,6 @@ properties:
       IDENTIFIER: '[a-z][a-z0-9_]*|[A-Z][A-Z0-9_]*'
       INTEGER: '0|[1-9][0-9]*'
       WHITESPACE: '\s+'
-allOf:
-  - if:
-      properties:
-        kind: {const: extension}
-      required: [kind]
-    then:
-      required: [extension]
-      not:
-        required: [pseudocode]
-    else:
-      required: [pseudocode]
-      not:
-        required: [extension]
 $defs:
   encoding:
     type: object
@@ -59,7 +44,6 @@ $defs:
       pattern:
         type: array
         minItems: 1
-        maxItems: 2
         items:
           type: string
           pattern: ^[01a-z]{8}$
@@ -70,17 +54,6 @@ $defs:
           $ref: '#/$defs/payload'
       autoupdate:
         $ref: '#/$defs/autoupdate'
-  extension:
-    type: object
-    additionalProperties: false
-    required: [id, bytes]
-    properties:
-      id:
-        type: string
-        pattern: ^[A-Z][A-Z0-9_]*$
-      bytes:
-        type: integer
-        minimum: 1
   fields:
     type: object
     minProperties: 1
@@ -140,7 +113,7 @@ $defs:
 x-interpretation-rules:
   - The containing mode-type directory and its modes.yaml declare the descriptor family and closed-world membership.
   - Each encodings entry is one wire encoding variant of the same semantic mode; listing the mode in a catalog activates all of its variants.
-  - Each encoding pattern is an ordered sequence of one or two descriptor bytes, each written most-significant bit first.
+  - Each encoding pattern is an ordered sequence of descriptor bytes, each written most-significant bit first; its length equals the selecting compact mode's extension.bytes.
   - Each encoding pattern length must equal the descriptor width registered for the containing extension ID.
   - The containing extension modes.yaml is a closed-world catalog; unlisted encodings are reserved.
   - Each lowercase pattern character denotes the field with the same key; constants are 0 or 1.
@@ -148,6 +121,8 @@ x-interpretation-rules:
   - Repetition of a pattern character across descriptor bytes denotes one logical field.
   - In every encoding pattern, the number of occurrences of each pattern character across all descriptor bytes must equal the bits value of its resolved field type.
   - Field roles are unique within a mode, and payload roles are unique within each encoding variant.
+  - In an extended EA, field roles and payload roles must each remain unique across the selecting compact form and the selected descriptor.
+  - Within one extended EA operand, consume the selecting compact encoding's payloads in their declared array order, followed by the selected descriptor encoding's payloads in their declared array order.
   - Field and payload type values are fully qualified logical references resolved through the common reference index.
   - An encoding variant's payloads are consumed in array order after every extended EA descriptor selected by the instruction.
   - The selecting compact extension form supplies the payload roles; an omitted displacement role has the implicit value zero.
@@ -155,6 +130,8 @@ x-interpretation-rules:
   - A field-sourced segment role resolves to the unique field with that role.
   - autoupdate type predecrement subtracts the positive difference before evaluation; postincrement adds it after evaluation.
   - autoupdate target resolves to the unique field with the named role.
-  - pseudocode may use field roles, payload roles supplied by the selecting compact extension form, scale, vlen_bytes, element_count, and explicit architectural register names as identifiers.
-  - memory modes assign one expression to offset; immediate modes assign one expression to value; extension modes do not declare pseudocode.
+  - Base and index fields use register_selector types for base.registers.GPR; segment fields use register types for base.registers.SEGMENT.
+  - pseudocode may use field roles, payload roles supplied by the selecting compact extension form, scale, vlen_bytes, element_count, and explicit scalar address register names R0 through R15, SP, and PC as identifiers.
+  - memory modes assign one expression to offset; immediate modes assign one expression to value.
+  - Only a compact mode may select an extension; an extended descriptor cannot select another extension.
   - The active catalog location selects the EA profile; profile identity is not repeated in the mode.

@@ -12,13 +12,13 @@ derived-outputs:
 preamble: artifacts/isa-reference/document/fragments/document_preamble.tex
 title-page: artifacts/isa-reference/document/fragments/title_page.tex
 body:
-- topic: base.manual.part.architectural-foundations
-- topic: base.architecture.overview.section
-- topic: base.architecture.overview.contract-position
-- topic: base.architecture.overview.manual-scope
-- topic: base.architecture.overview.profile
-- topic: base.manual.about.normative-material
-- topic: base.architecture.terminology.section
+- source: document/topics/001_architectural_foundations.tex
+- source: document/topics/overview/001_section.tex
+- source: document/topics/overview/002_contract_position.tex
+- source: document/topics/overview/003_manual_scope.tex
+- source: document/topics/overview/004_architectural_profile.tex
+- source: document/topics/about/001_normative_material.tex
+- source: document/topics/terminology/001_section.tex
 - term-group: base.term_groups.address_values
 - term-group: base.term_groups.memory_behavior
 - term-group: base.term_groups.segmentation_and_paging
@@ -45,7 +45,7 @@ body:
 - topic: base.encoding.data.data-formats.integer-data-sizes
 - topic: base.encoding.data.data-formats.little-endian-memory-organization
 - topic: FP.data-formats.floating-point-data-formats
-- topic: base.manual.part.encoding-addressing-and-execution
+- source: document/topics/002_encoding_addressing_and_execution.tex
 - topic: base.encoding.instruction.instruction-word-formats.instruction-encoding
 - topic: base.encoding.instruction.instruction-word-formats.instruction-stream-and-record-boundary
 - topic: base.encoding.instruction.instruction-word-formats.instruction-header-formats
@@ -89,7 +89,7 @@ body:
 - topic: base.memory.ordering.memory-model.fence-instructions
 - topic: base.memory.ordering.memory-model.global-sequentially-consistent-order
 - topic: base.repeat.streaming-execution-model.repeated-scalar-execution
-- topic: base.manual.part.system-programming
+- source: document/topics/003_system_programming.tex
 - topic: base.privilege.privileged-programming-model.privileged-execution-model
 - topic: base.privilege.privileged-programming-model.privilege-and-event-state
 - topic: base.privilege.privileged-programming-model.user-context-bank
@@ -148,7 +148,7 @@ body:
 - topic: VECTOR.state.vector-state-record
 - topic: CFI.state.control-flow-integrity-state-record
 - topic: base.state.save-restore-area.state-record-transfer-semantics
-- topic: base.manual.part.instruction-set-reference
+- source: document/topics/004_instruction_set_reference.tex
 - topic: base.instructions.instruction-description-intro.reading-an-instruction-description
 - topic: base.instructions.instruction-description-intro.entry-organization
 - topic: base.instructions.instruction-description-intro.assembler-source-grammar

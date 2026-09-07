@@ -26,6 +26,13 @@ $defs:
         type: string
         minLength: 1
         x-metasyntax: bedrock://schemas/instruction-metasyntax
+      fixed_operand_roles:
+        type: array
+        minItems: 1
+        uniqueItems: true
+        items:
+          type: string
+          pattern: ^[a-z][a-z0-9_]*$
       fields:
         $ref: '#/$defs/fields'
       payloads:
@@ -138,7 +145,7 @@ x-interpretation-rules:
   - A field or payload role either names an instruction.yaml operands key or is an encoding-only selector role such as size, condition, or memory_order.
   - Field and payload roles are unique within one encoding; fields bind their pattern character, and payloads are consumed in array order after the primary instruction bytes and every extended EA descriptor.
   - Access is inherited from the logical operand and is written only when representation access differs.
-  - Fixed registers and fixed literal operands are represented only by syntax and are matched to otherwise unrepresented logical operands in display order.
+  - Fixed register names and fixed literal values are represented only by syntax. fixed_operand_roles names their logical operand keys in fixed syntax occurrence order, with exactly one unique key per occurrence and no overlap with field or payload roles.
   - Effective-address purpose is derived from the logical operand role, and effective-address width is derived from the fixed or selected size suffix; neither is repeated in the encoding.
   - A fixed size suffix directly selects its size; a selected suffix binds its field marker to a size-selector field type; sizes is not repeated in the encoding.
   - A constraint role resolves to one field in the same encoding; allow and exclude values are interpreted in that field type's value domain.

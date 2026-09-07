@@ -18,11 +18,17 @@ function stack_request(kind : Primitive_request_kind, ordinal : int, state : Cpu
       effective_address = address, linear_address = point.linear,
       width = unsigned(sub_bits(range_end, address)), buffer_offset = 0
     }|],
+    validation_ranges = [|struct {
+      effective_address = address, linear_address = point.linear,
+      width = unsigned(sub_bits(range_end, address)),
+    }|],
     read_completion = ReadCompletionData, memory_cache_hint = MemoryCacheDefault,
     commit_point = commit_point, memory_order = ordinal,
     cache_policy = 0, suppress_fault = false, staged_updates = [||]
     , selector = 0x0000000000000000, expected = 0x0000000000000000,
-    desired = 0x0000000000000000, auxiliary = 0x0000000000000000, body_length = 0,
+    desired = 0x0000000000000000, auxiliary = 0x0000000000000000,
+    body_length = if access == AccessStackRead
+                  then unsigned(sub_bits(range_end, address)) else 0,
     payload_bytes = if kind == Write
                     then memory_value_bytes(value, unsigned(sub_bits(range_end, address)))
                     else [||]

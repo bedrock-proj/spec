@@ -146,6 +146,8 @@ x-interpretation-rules:
   - Every encoding variant has the same pattern-field set; every pattern character has exactly one fields entry, and every fields entry occurs in every pattern.
   - In every encoding pattern, the number of occurrences of each pattern character must equal the bits value of its resolved field type.
   - Field roles are unique within a mode, and payload roles are unique within each encoding variant.
+  - In an extended EA, field roles and payload roles must each remain unique across the selecting compact form and the selected descriptor.
+  - Within one extended EA operand, consume the selecting compact encoding's payloads in their declared array order, followed by the selected descriptor encoding's payloads in their declared array order.
   - Field and payload type values are fully qualified logical references resolved through the common reference index.
   - An encoding variant's payloads are consumed in array order after the compact selector and every extended EA descriptor selected by the instruction.
   - Pseudocode may reference the union of payload roles declared by the mode's encoding variants; an absent displacement role has the implicit value zero.
@@ -154,6 +156,7 @@ x-interpretation-rules:
   - A field-sourced segment role resolves to the unique field with that role.
   - autoupdate type predecrement subtracts the positive difference before evaluation; postincrement adds it after evaluation.
   - autoupdate target resolves to the unique field with the named role.
-  - pseudocode may use field roles, payload roles, scale, and explicit architectural register names as identifiers.
+  - Base and index fields use register_selector types for base.registers.GPR; segment fields use register types for base.registers.SEGMENT.
+  - pseudocode may use field roles, payload roles, scale, and explicit scalar address register names R0 through R15, SP, and PC as identifiers.
   - memory modes assign one expression to offset; immediate modes assign one expression to value; compact extension modes declare neither syntax nor pseudocode.
   - The active catalog location selects the EA profile; profile identity is not repeated in the mode.

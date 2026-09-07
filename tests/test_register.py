@@ -1,10 +1,12 @@
+
+from engine.isa.registers import load_registers
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
-from engine.extension import ExtensionSetCatalog
-from engine.register import (
+from engine.isa.extensions import load_extension_inventory
+from engine.isa.registers import (
     RegisterCatalog,
     RegisterGroupSourceConflictError,
     RegisterWidthDomainOrderError,
@@ -17,13 +19,13 @@ class RegisterCatalogTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.isa_root = Path(__file__).parents[1] / "isa"
-        cls.extensions = ExtensionSetCatalog.load(cls.isa_root)
-        cls.catalog = RegisterCatalog.load(cls.isa_root, cls.extensions)
+        cls.extensions = load_extension_inventory(cls.isa_root)
+        cls.catalog = load_registers(cls.isa_root, extensions=cls.extensions)
 
     def test_expands_regular_groups_without_member_directories(self) -> None:
         with self.fixture() as directory:
             root = Path(directory)
-            group = RegisterCatalog.load(root).references.groups[
+            group = load_registers(root, extensions=load_extension_inventory(root)).groups[
                 Reference.parse("base.registers.GPR")
             ]
 
@@ -37,19 +39,22 @@ class RegisterCatalogTest(unittest.TestCase):
         with self.fixture() as directory:
             root = Path(directory)
             (root / "registers/groups/GPR/group.yaml").write_text(
-                "width: {MAX_VLEN: [128, 512, 256]}\n"
-                "series: {prefix: R, count: 2}\n",
+                "width: {MAX_VLEN: [128, 512, 256]}\nseries: {prefix: R, count: 2}\n",
                 encoding="utf-8",
             )
 
             with self.assertRaises(RegisterWidthDomainOrderError):
-                RegisterCatalog.load(root)
+                load_registers(root, extensions=load_extension_inventory(root))
 
     def test_preserves_performance_selector_assignments(self) -> None:
-        registers = self.catalog.references.registers
+        registers = self.catalog.registers
 
-        self.assertEqual(registers[Reference.parse("base.registers.PERFORMANCE.CYCLE")].encoding, 1)
-        self.assertEqual(registers[Reference.parse("base.registers.PERFORMANCE.PTWALK")].encoding, 3)
+        self.assertEqual(
+            registers[Reference.parse("base.registers.PERFORMANCE.CYCLE")].encoding, 1
+        )
+        self.assertEqual(
+            registers[Reference.parse("base.registers.PERFORMANCE.PTWALK")].encoding, 3
+        )
 
     def test_rejects_series_with_explicit_register_directory(self) -> None:
         with self.fixture() as directory:
@@ -61,7 +66,7 @@ class RegisterCatalogTest(unittest.TestCase):
             )
 
             with self.assertRaises(RegisterGroupSourceConflictError):
-                RegisterCatalog.load(root)
+                load_registers(root, extensions=load_extension_inventory(root))
 
     def fixture(self):
         temporary = tempfile.TemporaryDirectory()
@@ -76,9 +81,7 @@ class RegisterCatalogTest(unittest.TestCase):
         ):
             shutil.copy2(self.isa_root / "schemas" / schema, root / "schemas" / schema)
         (root / "extensions/extensions.yaml").write_text("extensions: []\n")
-        (root / "registers/groups/groups.yaml").write_text(
-            "groups: [GPR]\n"
-        )
+        (root / "registers/groups/groups.yaml").write_text("groups: [GPR]\n")
         (root / "registers/groups/GPR/group.yaml").write_text(
             "width: 64\nseries: {prefix: R, count: 2}\n"
         )

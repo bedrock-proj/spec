@@ -5,7 +5,7 @@ type: string
 minLength: 1
 x-grammar: |
   expression = unary, { ("+" | "-"), unary } ;
-  unary = [ "-" ], primary ;
+  unary = "-", unary | primary ;
   primary = identifier | integer | "(", expression, ")" | call ;
   call = identifier, "(", [ expression, { ",", expression } ], ")" ;
 x-interpretation-rules:

@@ -8,141 +8,120 @@ import json
 from pathlib import Path
 import re
 
-from engine.generation import (
-    ArtifactGenerationContext,
-    ArtifactGenerator,
-    GeneratedArtifact,
-    GeneratedArtifactSet,
-)
+from engine.artifacts.generate import ArtifactGenerationContext
+from engine.artifacts.definition import GeneratedArtifact, GeneratedArtifactSet
 from engine.reference import Reference
+from dataclasses import dataclass
+from types import MappingProxyType
 
 
+@dataclass(frozen=True, slots=True)
 class _Node:
-    __slots__ = (
-        "id",
-        "domain",
-        "reference",
-        "kind",
-        "display",
-        "display_style",
-        "source",
+    id: str
+    domain: str
+    reference: Reference[object]
+    kind: str
+    display: str
+    display_style: str
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Occurrence:
+    source: str
+    target: str
+    kind: str
+
+
+def _inputs(definition, context):
+    def selected():
+        nodes = _nodes(definition, context)
+        return MappingProxyType(nodes), tuple(_occurrences(definition, context, nodes))
+    return context.shared_result((_inputs, id(definition), id(context.workspace)), selected)
+
+
+def validate(definition, context):
+    if set(definition.outputs) != {"view", "data"}:
+        raise ValueError(f"{definition.source}: reference graph requires view and data outputs")
+    _inputs(definition, context)
+
+
+def generate(definition, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
+    outputs = definition.outputs
+    nodes, occurrences = _inputs(definition, context)
+    graph_data = _render_graph(nodes, occurrences)
+    graph_json = _json(graph_data)
+    return GeneratedArtifactSet(
+        (
+            GeneratedArtifact(outputs["view"], _render_view(graph_data)),
+            GeneratedArtifact(outputs["data"], graph_json),
+        ),
+        artifact_id=definition.id,
     )
 
-    def __init__(
-        self,
-        id: str,
-        domain: str,
-        reference: Reference[object],
-        kind: str,
-        display: str,
-        display_style: str,
-        source: str,
-    ) -> None:
-        self.id = id
-        self.domain = domain
-        self.reference = reference
-        self.kind = kind
-        self.display = display
-        self.display_style = display_style
-        self.source = source
+
+def _nodes(definition, context: ArtifactGenerationContext) -> dict[str, _Node]:
+    nodes: dict[str, _Node] = {}
+    for domain in definition.inputs:
+        provider = context.workspace.require_provider(domain)
+        for entity in provider.entities.references.values():
+            presentation = provider.entities.presentation(entity.reference)
+            add_node(
+                nodes,
+                context,
+                domain=domain,
+                reference=entity.reference,
+                kind=_entity_type_name(entity),
+                display=presentation.display,
+                display_style=presentation.display_style.value,
+                source=entity.source,
+            )
+    return nodes
 
 
-class _Occurrence:
-    __slots__ = ("source", "target", "kind")
-
-    def __init__(
-        self,
-        source: str,
-        target: str,
-        kind: str,
-    ) -> None:
-        self.source = source
-        self.target = target
-        self.kind = kind
-
-
-class Generator(ArtifactGenerator):
-    """Render deterministic graph data and a standalone interactive viewer."""
-
-    def generate(self, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
-        outputs = self.definition.outputs
-
-        nodes = self._nodes(context)
-        occurrences = self._occurrences(context, nodes)
-        graph_data = _render_graph(nodes, occurrences)
-        graph_json = _json(graph_data)
-        return GeneratedArtifactSet(
-            (
-                GeneratedArtifact(outputs["view"], _render_view(graph_data)),
-                GeneratedArtifact(outputs["data"], graph_json),
-            ),
-            artifact_id=self.artifact_id,
-        )
-
-    def _nodes(self, context: ArtifactGenerationContext) -> dict[str, _Node]:
-        nodes: dict[str, _Node] = {}
-        for domain, provider in context.workspace.providers.items():
-            for entity in provider.entities.references.values():
-                presentation = provider.entities.presentation(entity.reference)
-                self._add_node(
-                    nodes,
-                    context,
-                    domain=domain,
-                    reference=entity.reference,
-                    kind=_entity_type_name(entity),
-                    display=presentation.display,
-                    display_style=presentation.display_style.value,
-                    source=entity.source,
-                )
-        return nodes
-
-    @staticmethod
-    def _add_node(
-        nodes: dict[str, _Node],
-        context: ArtifactGenerationContext,
-        *,
-        domain: str,
-        reference: Reference[object],
-        kind: str,
-        display: str,
-        display_style: str,
-        source: Path,
-    ) -> None:
-        if any(
+def add_node(
+    nodes: dict[str, _Node],
+    context: ArtifactGenerationContext,
+    *,
+    domain: str,
+    reference: Reference[object],
+    kind: str,
+    display: str,
+    display_style: str,
+    source: Path,
+) -> None:
+    if any(
+        (
             node.domain == domain and node.reference == reference
             for node in nodes.values()
-        ):
-            raise ValueError("duplicate reference-graph node")
-        local = ".".join(
-            (reference.owner, *reference.path, reference.element)
         )
-        node_id = f"{domain}:{local}"
-        nodes[node_id] = _Node(
-            id=node_id,
-            domain=domain,
-            reference=reference,
-            kind=kind,
-            display=display,
-            display_style=display_style,
-            source=_relative(source, context.workspace.root),
-        )
+    ):
+        raise ValueError("duplicate reference-graph node")
+    local = ".".join((reference.owner, *reference.path, reference.element))
+    node_id = f"{domain}:{local}"
+    nodes[node_id] = _Node(
+        id=node_id,
+        domain=domain,
+        reference=reference,
+        kind=kind,
+        display=display,
+        display_style=display_style,
+        source=_relative(source, context.workspace.root),
+    )
 
-    @staticmethod
-    def _occurrences(
-        context: ArtifactGenerationContext, nodes: Mapping[str, _Node]
-    ) -> list[_Occurrence]:
-        occurrences: list[_Occurrence] = []
-        for domain, provider in context.workspace.providers.items():
-            for dependency in provider.entity_dependencies():
-                source = _node_id(nodes, domain, dependency.source)
-                target = _node_id(
-                    nodes, dependency.target.domain, dependency.target.local
-                )
-                if target == source:
-                    continue
-                _require_known_edge(nodes, source, target)
-                occurrences.append(_Occurrence(source, target, dependency.kind))
-        return occurrences
+
+def _occurrences(
+    definition, context: ArtifactGenerationContext, nodes: Mapping[str, _Node]
+) -> list[_Occurrence]:
+    occurrences: list[_Occurrence] = []
+    for domain in definition.inputs:
+        provider = context.workspace.require_provider(domain)
+        for dependency in provider.entity_dependencies():
+            source = _node_id(nodes, domain, dependency.source)
+            target = _node_id(nodes, dependency.target.domain, dependency.target.local)
+            _require_known_edge(nodes, source, target)
+            occurrences.append(_Occurrence(source, target, dependency.kind))
+    return occurrences
 
 
 def _render_graph(

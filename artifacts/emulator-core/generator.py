@@ -3,22 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-from importlib import import_module
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 
-from engine.generation import (
-    ArtifactDefinition,
-    ArtifactGenerationContext,
-    ArtifactGenerator,
-    ArtifactWriter,
-    GeneratedArtifact,
-    GeneratedArtifactSet,
-)
-from engine.yaml_document import YamlDocumentLoader
+from engine.artifacts.definition import GeneratedArtifact, GeneratedArtifactSet
+from engine.artifacts.generate import ArtifactGenerationContext
+from engine.artifacts.write import write_artifacts
 
 
 _TEMPLATE_ROOT = Path(__file__).with_name("templates")
@@ -36,175 +29,107 @@ def _template(name: str) -> str:
     return (_TEMPLATE_ROOT / name).read_text()
 
 
-class SailCCompiler:
-    """Invoke Sail's C backend for one generated project."""
-
-    def __init__(self, executable: str | None = None) -> None:
-        self.executable = executable or os.environ.get("SAIL", "sail")
-
-    def cache_key(self) -> str:
-        result = subprocess.run(
-            [self.executable, "--version"], capture_output=True, text=True
+def sail_compiler_key(executable) -> str:
+    result = subprocess.run([executable, "--version"], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Sail version query failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                "Sail version query failed\n"
-                f"stdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
-            )
-        executable = shutil.which(self.executable) or self.executable
-        return f"{Path(executable).resolve()}\n{result.stdout}{result.stderr}"
+    executable = shutil.which(executable) or executable
+    return f"{Path(executable).resolve()}\n{result.stdout}{result.stderr}"
 
-    def compile(self, project: Path, output_prefix: Path) -> tuple[str, str]:
-        command = [
-            self.executable,
-            "--project",
-            str(project),
-            "--all-modules",
-            "-c",
-            "--c-no-main",
-            "-O",
-            "--static",
-            "--c-specialize",
-            "--Oconstant-fold",
-        ]
-        for function in _PRESERVED_FUNCTIONS:
-            command.extend(("--c-preserve", function))
-        command.extend(("-o", str(output_prefix)))
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(
-                "Sail C generation failed\n"
-                f"stdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
-            )
-        return (
-            output_prefix.with_suffix(".c").read_text(),
-            output_prefix.with_suffix(".h").read_text(),
+
+def compile_sail_c(executable, project: Path, output_prefix: Path) -> tuple[str, str]:
+    command = [
+        executable,
+        "--project",
+        str(project),
+        "--all-modules",
+        "-c",
+        "--c-no-main",
+        "-O",
+        "--static",
+        "--c-specialize",
+        "--Oconstant-fold",
+    ]
+    for function in _PRESERVED_FUNCTIONS:
+        command.extend(("--c-preserve", function))
+    command.extend(("-o", str(output_prefix)))
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Sail C generation failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
         )
+    return (
+        output_prefix.with_suffix(".c").read_text(),
+        output_prefix.with_suffix(".h").read_text(),
+    )
 
 
-class Generator(ArtifactGenerator):
-    """Compile the generated Sail model and attach its C adapter."""
-
-    def __init__(
-        self,
-        definition: ArtifactDefinition,
-        compiler: SailCCompiler | None = None,
-    ) -> None:
-        super().__init__(definition)
-        self.compiler = compiler or SailCCompiler()
-
-    def generate(self, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
-        outputs = self.definition.outputs
-        with tempfile.TemporaryDirectory(prefix="bedrock-emulator-core-") as directory:
-            root = Path(directory).resolve()
-            model_root = root / "model"
-            source_alias = root / "source"
-            source_alias.symlink_to(context.workspace.root, target_is_directory=True)
-            model = self._sail_model_generator(context)
-            model_context = ArtifactGenerationContext.create(
-                context.workspace, model_root
-            )
-            model_artifacts = model.generate(model_context)
-            model_artifacts = _use_source_alias(
-                model_artifacts,
-                model.definition.outputs["project"],
-                model_root,
-                context.workspace.root,
-                source_alias,
-            )
-            model.definition.validate_generated(model_artifacts)
-            ArtifactWriter().write(model_artifacts, model_root)
-            compiler_cache_key = getattr(self.compiler, "cache_key", None)
-            cacheable = callable(compiler_cache_key)
-            fingerprint = _generation_fingerprint(
-                model_artifacts,
-                compiler_cache_key() if cacheable else type(self.compiler).__qualname__,
-                model.declared_sources(model_context),
-                context.workspace.root,
-            )
-
-            cached_c = context.output_root / outputs["implementation"]
-            cached_h = context.output_root / outputs["model-header"]
-            cached_stamp = context.output_root / outputs["generation-stamp"]
-            cache_hit = (
-                cacheable
-                and cached_c.is_file()
-                and cached_h.is_file()
-                and cached_stamp.is_file()
-                and cached_stamp.read_text() == fingerprint
-            )
-            if cache_hit:
-                generated_c = cached_c.read_text()
-                generated_h = cached_h.read_text()
-            else:
-                generated_c, generated_h = self.compiler.compile(
-                    model_root / model.definition.outputs["project"],
-                    root / "bedrock_core",
-                )
-                generated_c = _supply_library_main(
-                    generated_c, _template("model_main.c")
-                )
-                generated_c += "\n" + _template("bedrock_core_adapter.c")
-
-        return GeneratedArtifactSet(
-            (
-                GeneratedArtifact(
-                    outputs["implementation"],
-                    generated_c,
-                ),
-                GeneratedArtifact(outputs["model-header"], generated_h),
-                GeneratedArtifact(
-                    outputs["abi-header"],
-                    _template("bedrock_core_abi.h"),
-                ),
-                GeneratedArtifact(outputs["generation-stamp"], fingerprint),
-            ),
-            self.artifact_id,
+def generate(definition, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
+    executable = os.environ.get("SAIL", "sail")
+    outputs = definition.outputs
+    with tempfile.TemporaryDirectory(prefix="bedrock-emulator-core-") as directory:
+        root = Path(directory).resolve()
+        model_root = root / "model"
+        source_alias = root / "source"
+        source_alias.symlink_to(context.workspace.root, target_is_directory=True)
+        model = context.registry.definition("sail-model")
+        program = context.registry.entrypoint("sail-model", "project_program")(model, context)
+        model_artifacts = context.registry.entrypoint("sail-model", "render_program")(
+            model, program, model_root,
+            source_root=context.workspace.root, source_alias=source_alias,
         )
-
-    def validate(self, context: ArtifactGenerationContext) -> None:
-        """Validate the source projection without invoking the Sail compiler."""
-
-        model = self._sail_model_generator(context)
-        model_context = ArtifactGenerationContext.create(
-            context.workspace, context.output_root / "sail-model"
+        model.validate_generated(model_artifacts)
+        write_artifacts(model_artifacts, model_root)
+        fingerprint = _generation_fingerprint(
+            model_artifacts,
+            sail_compiler_key(executable),
+            program.sources,
+            context.workspace.root,
         )
-        model_artifacts = model.generate(model_context)
-        model.definition.validate_generated(model_artifacts)
-
-        for template in (
-            "model_main.c",
-            "bedrock_core_adapter.c",
-            "bedrock_core_abi.h",
-        ):
-            _template(template)
-
-        outputs = self.definition.outputs
-        projected = GeneratedArtifactSet(
-            tuple(
-                GeneratedArtifact(outputs[name], b"")
-                for name in (
-                    "implementation",
-                    "model-header",
-                    "abi-header",
-                    "generation-stamp",
-                )
-            ),
-            artifact_id=self.artifact_id,
+        cached_c = context.output_root / outputs["implementation"]
+        cached_h = context.output_root / outputs["model-header"]
+        cached_stamp = context.output_root / outputs["generation-stamp"]
+        cache_hit = (
+            cached_c.is_file()
+            and cached_h.is_file()
+            and cached_stamp.is_file()
+            and (cached_stamp.read_text() == fingerprint)
         )
-        self.definition.validate_generated(projected)
+        if cache_hit:
+            generated_c = cached_c.read_text()
+            generated_h = cached_h.read_text()
+        else:
+            generated_c, generated_h = compile_sail_c(
+                executable, model_root / model.outputs["project"], root / "bedrock_core"
+            )
+            generated_c = _supply_library_main(generated_c, _template("model_main.c"))
+            generated_c += "\n" + _template("bedrock_core_adapter.c")
+    return GeneratedArtifactSet(
+        (
+            GeneratedArtifact(outputs["implementation"], generated_c),
+            GeneratedArtifact(outputs["model-header"], generated_h),
+            GeneratedArtifact(outputs["abi-header"], _template("bedrock_core_abi.h")),
+            GeneratedArtifact(outputs["generation-stamp"], fingerprint),
+        ),
+        definition.id,
+    )
 
-    @staticmethod
-    def _sail_model_generator(context: ArtifactGenerationContext) -> ArtifactGenerator:
-        workspace_root = context.workspace.root
-        schema = YamlDocumentLoader().mapping(workspace_root / "artifacts/schema.yaml")
-        definition = ArtifactDefinition.load(
-            workspace_root / "artifacts/sail-model/artifact.yaml", schema
-        )
-        generator_type = import_module("artifacts.sail-model.generator").Generator
-        return generator_type(definition)
+
+def validate(definition, context: ArtifactGenerationContext) -> None:
+    """Validate the source projection without invoking the Sail compiler."""
+    model = context.registry.definition("sail-model")
+    context.registry.entrypoint("sail-model", "validate")(model, context)
+    for template in ("model_main.c", "bedrock_core_adapter.c", "bedrock_core_abi.h"):
+        _template(template)
+    required = {"implementation", "model-header", "abi-header", "generation-stamp"}
+    if set(definition.outputs) != required:
+        raise ValueError(f"{definition.source}: emulator core requires exactly {sorted(required)} output roles")
 
 
 def _generation_fingerprint(
@@ -237,26 +162,6 @@ def _generation_fingerprint(
     return digest.hexdigest() + "\n"
 
 
-def _use_source_alias(
-    artifacts: GeneratedArtifactSet,
-    project_path: Path,
-    model_root: Path,
-    repository: Path,
-    source_alias: Path,
-) -> GeneratedArtifactSet:
-    """Route authored source paths through one safe external-temporary alias."""
-
-    repository_prefix = Path(os.path.relpath(repository, model_root)).as_posix() + "/"
-    alias_prefix = Path(os.path.relpath(source_alias, model_root)).as_posix() + "/"
-    projected = []
-    for artifact in artifacts.artifacts:
-        content = artifact.content
-        if artifact.relative_path == project_path:
-            if not isinstance(content, str):
-                raise TypeError("Sail project artifact must be text")
-            content = content.replace(repository_prefix, alias_prefix)
-        projected.append(GeneratedArtifact(artifact.relative_path, content))
-    return GeneratedArtifactSet(tuple(projected), artifacts.artifact_id)
 
 
 def _supply_library_main(generated_c: str, library_main: str) -> str:

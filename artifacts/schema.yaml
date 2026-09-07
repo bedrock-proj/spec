@@ -63,4 +63,4 @@ x-interpretation-rules:
 - An output root may name one generated file or a closed generated tree, and every emitted file belongs to exactly one root.
 - Inputs name workspace domain providers, while depends-on names generated artifacts.
 - Artifact-local generators validate their configuration and are pure projections.
-- Only ArtifactWriter mutates output trees.
+- Only write_artifacts() mutates output trees.

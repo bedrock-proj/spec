@@ -16,7 +16,7 @@ function vector_fp_conversion_source_kind(
         0x05
     } else {
         if vector_fp_conversion_destination_fp(operation) then {
-            match instruction.form.sizes {
+            match size_codes(instruction.form.sizes) {
                 Size_L :: _ => 0x04,
                 Size_Q :: _ => 0x04,
                 _ => vector_fp_value_kind(source_bytes),

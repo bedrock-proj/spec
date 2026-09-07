@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Sequence
+import json
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum
-import json
 from pathlib import Path
 
 
@@ -21,6 +21,9 @@ class RelatedLocation:
     message: str
     path: tuple[str | int, ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", tuple(self.path))
+
 
 @dataclass(frozen=True, slots=True)
 class Diagnostic:
@@ -31,71 +34,88 @@ class Diagnostic:
     path: tuple[str | int, ...] = ()
     related: tuple[RelatedLocation, ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", tuple(self.path))
+        object.__setattr__(self, "related", tuple(self.related))
+
     def location(self) -> str:
-        suffix = "".join(
-            f"[{part}]" if isinstance(part, int) else f".{part}" for part in self.path
-        )
-        return f"{self.source}{suffix}"
+        return _location(self.source, self.path)
 
 
+@dataclass(frozen=True, slots=True)
 class DiagnosticBag(Sequence[Diagnostic]):
-    """An ordered collection that can be rendered for people or automation."""
+    """An immutable ordered collection of completed diagnostics."""
 
-    def __init__(self, diagnostics: Iterable[Diagnostic] = ()) -> None:
-        self._diagnostics = list(diagnostics)
+    diagnostics: tuple[Diagnostic, ...] = ()
 
-    def add(self, diagnostic: Diagnostic) -> None:
-        self._diagnostics.append(diagnostic)
-
-    def extend(self, diagnostics: Iterable[Diagnostic]) -> None:
-        self._diagnostics.extend(diagnostics)
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
 
     @property
     def has_errors(self) -> bool:
-        return any(item.severity is Severity.ERROR for item in self._diagnostics)
+        return any(item.severity is Severity.ERROR for item in self.diagnostics)
 
-    def render_text(self) -> str:
-        blocks: list[str] = []
-        for item in self._diagnostics:
-            lines = [
-                f"{item.location()}: {item.severity.value}[{item.code}]: {item.message}"
-            ]
-            lines.extend(
-                f"  related: {related.source}: {related.message}"
-                for related in item.related
-            )
-            blocks.append("\n".join(lines))
-        return "\n".join(blocks)
-
-    def render_json(self) -> str:
-        return json.dumps(
-            [
-                {
-                    "severity": item.severity.value,
-                    "code": item.code,
-                    "source": str(item.source),
-                    "path": list(item.path),
-                    "message": item.message,
-                    "related": [
-                        {
-                            "source": str(related.source),
-                            "path": list(related.path),
-                            "message": related.message,
-                        }
-                        for related in item.related
-                    ],
-                }
-                for item in self._diagnostics
-            ],
-            indent=2,
-            sort_keys=True,
-        )
-
-    def __getitem__(self, index: int | slice) -> Diagnostic | list[Diagnostic]:
-        return self._diagnostics[index]
+    def __getitem__(self, index: int | slice) -> Diagnostic | tuple[Diagnostic, ...]:
+        return self.diagnostics[index]
 
     def __iter__(self) -> Iterator[Diagnostic]:
-        return iter(self._diagnostics)
+        return iter(self.diagnostics)
 
     def __len__(self) -> int:
-        return len(self._diagnostics)
+        return len(self.diagnostics)
+
+
+def _location(source: Path, path: tuple[str | int, ...]) -> str:
+    suffix = "".join(
+        f"[{part}]" if isinstance(part, int) else f".{part}" for part in path
+    )
+    return f"{source}{suffix}"
+
+
+def render_diagnostics_text(bag: DiagnosticBag) -> str:
+    blocks: list[str] = []
+    for item in bag:
+        lines = [
+            f"{item.location()}: {item.severity.value}[{item.code}]: {item.message}"
+        ]
+        lines.extend(
+            f"  related: {_location(related.source, related.path)}: {related.message}"
+            for related in item.related
+        )
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
+
+
+def render_diagnostics_json(bag: DiagnosticBag) -> str:
+    return json.dumps(
+        [
+            {
+                "severity": item.severity.value,
+                "code": item.code,
+                "source": str(item.source),
+                "path": list(item.path),
+                "message": item.message,
+                "related": [
+                    {
+                        "source": str(related.source),
+                        "path": list(related.path),
+                        "message": related.message,
+                    }
+                    for related in item.related
+                ],
+            }
+            for item in bag
+        ],
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def _error(
+    code: str,
+    source: Path,
+    message: str,
+    *path: str | int,
+    related: tuple[RelatedLocation, ...] = (),
+) -> Diagnostic:
+    return Diagnostic(Severity.ERROR, code, source, message, tuple(path), related)

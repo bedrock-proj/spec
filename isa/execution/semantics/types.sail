@@ -66,6 +66,22 @@ struct Memory_access_range = {
   buffer_offset : int,
 }
 
+struct Memory_validation_range = {
+  effective_address : bits(64),
+  linear_address : bits(64),
+  width : int,
+}
+
+function memory_validation_ranges(ranges : list(Memory_access_range))
+  -> list(Memory_validation_range) = match ranges {
+  [||] => [||],
+  range :: tail => struct {
+    effective_address = range.effective_address,
+    linear_address = range.linear_address,
+    width = range.width,
+  } :: memory_validation_ranges(tail),
+}
+
 enum Debug_stop_kind = {
     DebugStopExecution,
     DebugStopMemoryRead,
@@ -235,13 +251,17 @@ struct Primitive_request = {
   address_translation : bool,
   /* A debug-validation request returns the ordinary response kind after all
      pre-access checks, without performing a memory or device access, and
-     places the translated starting address in response.value.  The reissued
+     places the translated first validation range address (or the point address
+     for a non-data request) in response.value.  The reissued
      debug-validated request performs the access at physical_address without
      repeating translation or permission checks. */
   debug_validation : bool,
   debug_validated : bool,
   physical_address : bits(64),
   memory_ranges : list(Memory_access_range),
+  /* Pre-access validation can cover bytes that a state record does not transfer.
+     Predicated vector requests include only active lanes in both lists. */
+  validation_ranges : list(Memory_validation_range),
   read_completion : Read_completion,
   memory_cache_hint : Memory_cache_hint,
   commit_point : bool,
@@ -543,6 +563,8 @@ struct Transaction_response = {
   success : bool,
   fault_kind : Fault_kind,
   fault_cause : int,
+  /* A failed memory response identifies the range that supplied the failure. */
+  fault_range : option(Memory_validation_range),
   detail : string,
   value : bits(64),
   secondary_value : bits(64),

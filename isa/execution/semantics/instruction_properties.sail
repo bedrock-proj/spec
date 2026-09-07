@@ -131,47 +131,18 @@ function size_code_bytes(code : Size_code) -> int = match code {
     _ => 8,
 }
 
-function size_list_count(items : list(Size_code)) -> int = match items {
-    [||] => 0,
-    _ :: tail => 1 + size_list_count(tail),
-}
-
-function size_at(items : list(Size_code), index : int) -> Size_code = match items {
+function size_at(items : list((int, Size_code)), selector : int) -> Size_code = match items {
     [||] => Size_Q,
-    item :: tail => if index <= 0 then {
-        item
-    } else {
-        size_at(tail, index - 1)
-    },
+    (value, code) :: tail => if value == selector then code else size_at(tail, selector),
 }
 
 val condition_size_field : list(Decoded_field) -> option(int)
 
 function operation_width(instruction : Decoded_instruction) -> int =
     match condition_size_field(instruction.fields) {
-        Some(selector) => {
-            if instruction.form.instruction_set == VectorSet | instruction.form.instruction_set == VectorFpuSet then {
-                if selector == 0 then {
-                    1
-                } else {
-                    if selector == 1 | selector == 5 then {
-                        2
-                    } else {
-                        if selector == 2 | selector == 6 then { 4 } else { 8 }
-                    }
-                }
-            } else {
-                let count = size_list_count(instruction.form.sizes);
-                let index = if count == 3 then {
-                        selector - 1
-                    } else {
-                        selector
-                    };
-                size_code_bytes(size_at(instruction.form.sizes, index))
-            }
-        },
+        Some(selector) => size_code_bytes(size_at(instruction.form.sizes, selector)),
         None() => match instruction.form.sizes {
-            code :: _ => size_code_bytes(code),
+            (_, code) :: _ => size_code_bytes(code),
             [||] => 8,
         },
     }

@@ -1,17 +1,15 @@
-// Shared register-only vector compute families. Instruction files own only metadata and lowering.
+// Shared register-only vector compute families. Instruction files own operation metadata and entries.
 
 function vector_integer_binary_compute(instruction : Decoded_instruction, state : Cpu_state) -> option(Vector_compute_result) = {
     let operation = instruction.form.operation;
     let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
     let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
-    let zero_vector = zero_vector_bytes(active_bytes);
     let fp_form : bool = match condition_size_field(instruction.fields) {
         Some(selector) => selector >= 5,
         None() => false,
     };
-    if (true | true | true | true | true | true | true | true | true | true | true | true | true) & not_bool(fp_form) then {
+    if not_bool(fp_form) then {
         match (
             vector_register_index(instruction, Operand_src),
             vector_register_index(instruction, Operand_dst),
@@ -42,13 +40,11 @@ function vector_integer_unary_compute(instruction : Decoded_instruction, state :
     let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
     let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
-    let zero_vector = zero_vector_bytes(active_bytes);
     let fp_form : bool = match condition_size_field(instruction.fields) {
         Some(selector) => selector >= 5,
         None() => false,
     };
-    if (true | true | true | true | true | true | true | true | true) & not_bool(fp_form) then {
+    if not_bool(fp_form) then {
         match (vector_register_index(instruction, Operand_dst), predicate_register_index(instruction, Operand_govern)) {
             (Some(destination), Some(predicate)) => {
                 var updated = state;
@@ -104,42 +100,33 @@ function vector_shift_compute(instruction : Decoded_instruction, state : Cpu_sta
     let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
     let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
     let zero_vector = zero_vector_bytes(active_bytes);
-    let fp_form : bool = match condition_size_field(instruction.fields) {
-        Some(selector) => selector >= 5,
-        None() => false,
-    };
-    if true | true | true | true | true then {
-        match (vector_register_index(instruction, Operand_dst), predicate_register_index(instruction, Operand_govern)) {
-            (Some(destination), Some(predicate)) => {
-                let count_vector = vector_register_index(instruction, Operand_src);
-                let counts : list(bits(8)) = match count_vector {
-                    Some(index) => state.vector_registers[unsigned(index)],
-                    None() => zero_vector,
-                };
-                let scalar_count : int = match operand_named(instruction, Operand_count) {
-                    Some(count_operand) => unsigned(immediate_value(count_operand)),
-                    None() => 0,
-                };
-                var updated = state;
-                updated.vector_registers[unsigned(destination)] = vector_shift_image(
-                    operation,
-                    state.vector_registers[unsigned(destination)],
-                    counts,
-                    scalar_count,
-                    count_vector != None(),
-                    state.predicate_registers[unsigned(predicate)],
-                    0,
-                    lanes,
-                    element_bytes,
-                );
-                Some(VectorComputeState(updated))
-            },
-            _ => None(),
-        }
-    } else {
-        None()
+    match (vector_register_index(instruction, Operand_dst), predicate_register_index(instruction, Operand_govern)) {
+        (Some(destination), Some(predicate)) => {
+            let count_vector = vector_register_index(instruction, Operand_src);
+            let counts : list(bits(8)) = match count_vector {
+                Some(index) => state.vector_registers[unsigned(index)],
+                None() => zero_vector,
+            };
+            let scalar_count : int = match operand_named(instruction, Operand_count) {
+                Some(count_operand) => unsigned(immediate_value(count_operand)),
+                None() => 0,
+            };
+            var updated = state;
+            updated.vector_registers[unsigned(destination)] = vector_shift_image(
+                operation,
+                state.vector_registers[unsigned(destination)],
+                counts,
+                scalar_count,
+                count_vector != None(),
+                state.predicate_registers[unsigned(predicate)],
+                0,
+                lanes,
+                element_bytes,
+            );
+            Some(VectorComputeState(updated))
+        },
+        _ => None(),
     }
 }
 
@@ -149,13 +136,11 @@ function vector_integer_compare_compute(instruction : Decoded_instruction, state
     let active_bytes = vector_current_length_bytes(state);
     let active_predicate_bytes = tdiv_int(active_bytes, 8);
     let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(active_predicate_bytes);
-    let zero_vector = zero_vector_bytes(active_bytes);
     let fp_form : bool = match condition_size_field(instruction.fields) {
         Some(selector) => selector >= 5,
         None() => false,
     };
-    if (true | true | true) & not_bool(fp_form) then {
+    if not_bool(fp_form) then {
         match (
             vector_register_index(instruction, Operand_lhs),
             vector_register_index(instruction, Operand_rhs),
@@ -195,43 +180,32 @@ function vector_width_change_compute(instruction : Decoded_instruction, state : 
     let operation = instruction.form.operation;
     let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
-    let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
-    let zero_vector = zero_vector_bytes(active_bytes);
-    let fp_form : bool = match condition_size_field(instruction.fields) {
-        Some(selector) => selector >= 5,
-        None() => false,
-    };
-    if true | true | true | true | true | true | true | true | true then {
-        match (
-            vector_register_index(instruction, Operand_src),
-            vector_register_index(instruction, Operand_dst),
-            predicate_register_index(instruction, Operand_govern),
-        ) {
-            (Some(source), Some(destination), Some(predicate)) => {
-                let destination_bytes = vector_width_change_destination_bytes(operation);
-                let container_bytes = if element_bytes > destination_bytes then {
-                        element_bytes
-                    } else {
-                        destination_bytes
-                    };
-                var updated = state;
-                updated.vector_registers[unsigned(destination)] = vector_width_change_image(
-                    operation,
-                    state.vector_registers[unsigned(destination)],
-                    state.vector_registers[unsigned(source)],
-                    state.predicate_registers[unsigned(predicate)],
-                    0,
-                    tdiv_int(active_bytes, container_bytes),
-                    element_bytes,
-                    destination_bytes,
-                );
-                Some(VectorComputeState(updated))
-            },
-            _ => None(),
-        }
-    } else {
-        None()
+    match (
+        vector_register_index(instruction, Operand_src),
+        vector_register_index(instruction, Operand_dst),
+        predicate_register_index(instruction, Operand_govern),
+    ) {
+        (Some(source), Some(destination), Some(predicate)) => {
+            let destination_bytes = vector_width_change_destination_bytes(operation);
+            let container_bytes = if element_bytes > destination_bytes then {
+                    element_bytes
+                } else {
+                    destination_bytes
+                };
+            var updated = state;
+            updated.vector_registers[unsigned(destination)] = vector_width_change_image(
+                operation,
+                state.vector_registers[unsigned(destination)],
+                state.vector_registers[unsigned(source)],
+                state.predicate_registers[unsigned(predicate)],
+                0,
+                tdiv_int(active_bytes, container_bytes),
+                element_bytes,
+                destination_bytes,
+            );
+            Some(VectorComputeState(updated))
+        },
+        _ => None(),
     }
 }
 
@@ -240,41 +214,32 @@ function vector_permute_compute(instruction : Decoded_instruction, state : Cpu_s
     let element_bytes = operation_width(instruction);
     let active_bytes = vector_current_length_bytes(state);
     let lanes = tdiv_int(active_bytes, element_bytes);
-    let empty = zero_vector_bytes(tdiv_int(active_bytes, 8));
     let zero_vector = zero_vector_bytes(active_bytes);
-    let fp_form : bool = match condition_size_field(instruction.fields) {
-        Some(selector) => selector >= 5,
-        None() => false,
-    };
-    if true | true | true | true | true | true | true | true | true | true then {
-        match (vector_register_index(instruction, Operand_dst), predicate_register_index(instruction, Operand_govern)) {
-            (Some(destination), Some(predicate)) => {
-                let source : list(bits(8)) = match vector_register_index(instruction, Operand_src) {
-                    Some(index) => state.vector_registers[unsigned(index)],
-                    None() => zero_vector,
-                };
-                let count : int = match operand_named(instruction, Operand_count) {
-                    Some(count_operand) => unsigned(immediate_value(count_operand)),
-                    None() => 0,
-                };
-                let original = state.vector_registers[unsigned(destination)];
-                var updated = state;
-                updated.vector_registers[unsigned(destination)] = vector_permute_image(
-                    operation,
-                    original,
-                    source,
-                    original,
-                    state.predicate_registers[unsigned(predicate)],
-                    0,
-                    lanes,
-                    element_bytes,
-                    count,
-                );
-                Some(VectorComputeState(updated))
-            },
-            _ => None(),
-        }
-    } else {
-        None()
+    match (vector_register_index(instruction, Operand_dst), predicate_register_index(instruction, Operand_govern)) {
+        (Some(destination), Some(predicate)) => {
+            let source : list(bits(8)) = match vector_register_index(instruction, Operand_src) {
+                Some(index) => state.vector_registers[unsigned(index)],
+                None() => zero_vector,
+            };
+            let count : int = match operand_named(instruction, Operand_count) {
+                Some(count_operand) => unsigned(immediate_value(count_operand)),
+                None() => 0,
+            };
+            let original = state.vector_registers[unsigned(destination)];
+            var updated = state;
+            updated.vector_registers[unsigned(destination)] = vector_permute_image(
+                operation,
+                original,
+                source,
+                original,
+                state.predicate_registers[unsigned(predicate)],
+                0,
+                lanes,
+                element_bytes,
+                count,
+            );
+            Some(VectorComputeState(updated))
+        },
+        _ => None(),
     }
 }

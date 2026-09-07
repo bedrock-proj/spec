@@ -5,11 +5,11 @@ type: string
 minLength: 1
 x-ebnf: |
   instruction = instruction_head, [" ", operand_list] ;
-  instruction_head = MNEMONIC, [size_suffix] ;
+  instruction_head = MNEMONIC, [size_suffix], [order_selector] ;
 
   size_suffix = fixed_size_suffix | selected_size_suffix ;
   fixed_size_suffix = ".", IDENTIFIER ;
-  selected_size_suffix = ".{", IDENTIFIER, {"|", IDENTIFIER}, "}", field_expression, [order_selector] ;
+  selected_size_suffix = ".{", IDENTIFIER, {"|", IDENTIFIER}, "}", field_expression ;
   order_selector = "/order", field_expression ;
 
   operand_list = operand, {", ", operand} ;
@@ -43,7 +43,7 @@ x-interpretation-rules:
   - Outside an address expression, whitespace is significant: one space separates the instruction head from its first operand, and comma followed by one space separates operands.
   - Whitespace may occur only where ADDRESS_WHITESPACE appears inside an address expression.
   - A selected size suffix contains one or more distinct public size suffix identifiers and binds them to the following field expression.
-  - An order selector is permitted only after a selected size suffix.
+  - An order selector binds the memory-order field independently of whether a size suffix is fixed, selected, or absent.
   - A field expression contains exactly one lowercase field marker.
   - Angle brackets are part of an operand reference and must be paired.
   - A nested address inside an address expression denotes lane indexing; plus and asterisk are the only address operators.

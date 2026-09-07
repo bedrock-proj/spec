@@ -1,5 +1,3 @@
-enum Record_class = FixedExtraShort | FixedShort | ExtendedMedium | ExtendedLong | ExtendedExtraLong | ExtendedXxlong
-
 function extracted_field(encoding : bits(64), positions : list(range(0, 63)), accumulated : int) -> int =
   match positions {
     [||] => accumulated,
@@ -18,10 +16,7 @@ function value_in_ranges(value : int, ranges : list(Catalog_range)) -> bool = ma
 
 function constraint_matches(encoding : bits(64), item : Catalog_constraint) -> bool = {
   let value = extracted_field(encoding, item.field_positions, 0);
-  match item.kind {
-    AllowRanges => value_in_ranges(value, item.ranges),
-    ExcludeImmediate => not_bool(91 <= value & value <= 94),
-  }
+  value_in_ranges(value, item.ranges)
 }
 
 function constraints_match(encoding : bits(64), constraints : list(Catalog_constraint)) -> bool =
@@ -56,49 +51,30 @@ function byte_count(bytes : list(bits(8))) -> int = match bytes {
   _ :: tail => 1 + byte_count(tail),
 }
 
-function class_minimum(record_class : Record_class) -> int = match record_class {
-  FixedExtraShort => 1,
-  FixedShort => 2,
-  ExtendedMedium => 3,
-  ExtendedLong => 4,
-  ExtendedExtraLong => 5,
-  ExtendedXxlong => 6,
-}
-
-function extended_class(selector : int, encoding_prefix : int) -> Record_class =
-  if selector <= 59 then ExtendedMedium
-  else if selector <= 62 then ExtendedLong
-  else if encoding_prefix == 255 then ExtendedXxlong
-  else ExtendedExtraLong
-
 function frame_record(bytes : list(bits(8))) -> option(Framed_record) = match bytes {
-  [|byte0|] =>
-    if byte0[7] == bitzero then
-      Some(struct { record_class = FixedExtraShort, encoded_length = 1 })
-    else None(),
-  [|byte0, _|] =>
-    if byte0[7 .. 6] == 0b10 then
-      Some(struct { record_class = FixedShort, encoded_length = 2 })
-    else None(),
-  byte0 :: byte1 :: _ :: _ => {
-    let actual = byte_count(bytes);
-    let encoded = 3 + unsigned(byte0[5 .. 2]);
-    let selector = unsigned(byte0[1 .. 0] @ byte1[7 .. 4]);
-    let encoding_prefix = unsigned(byte0[1 .. 0] @ byte1[7 .. 2]);
-    let record_class = extended_class(selector, encoding_prefix);
-    if byte0[7 .. 6] == 0b11
-       & actual == encoded
-       & actual >= class_minimum(record_class)
-    then Some(struct { record_class = record_class, encoded_length = encoded })
-    else None()
+  [||] => None(),
+  byte0 :: tail => {
+    let second : option(bits(8)) = match tail {
+      [||] => None(),
+      byte1 :: _ => Some(byte1),
+    };
+    match framing_class(byte0, second) {
+      None() => None(),
+      Some(record_class) => {
+        let actual = byte_count(bytes);
+        let encoded = encoded_record_length(record_class, byte0);
+        if actual == encoded & actual >= class_minimum(record_class)
+        then Some(struct { record_class = record_class, encoded_length = encoded })
+        else None()
+      },
+    }
   },
-  _ => None(),
 }
 
 function required_bytes_sufficient(frame : Framed_record, required_bytes : int) -> bool =
   required_bytes >= class_minimum(frame.record_class)
   & required_bytes <= frame.encoded_length
-  & required_bytes <= 18
+  & required_bytes <= architecture_max_record_bytes
 
 function zero_bytes(bytes : list(bits(8))) -> list(bits(8)) = match bytes {
   [||] => [||],

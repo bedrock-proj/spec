@@ -7,6 +7,8 @@ from engine.reference import (
     ReferenceError,
     ReferenceIndex,
     UnknownReferenceError,
+    register_reference,
+    resolve_reference,
 )
 
 
@@ -36,22 +38,25 @@ class ReferenceTest(unittest.TestCase):
                 Reference.parse(value)
 
     def test_index_normalizes_and_resolves_references(self) -> None:
-        index = ReferenceIndex[int]()
-        reference = index.register(Reference.parse("base.ea.compact.register"), 7)
+        index = {}
+        reference = register_reference(
+            index, Reference.parse("base.ea.compact.register"), 7
+        )
 
-        self.assertEqual(index.resolve(reference), 7)
+        self.assertEqual(resolve_reference(index, reference), 7)
         self.assertEqual(index[reference], 7)
         with self.assertRaises(DuplicateReferenceError):
-            index.register(reference, 8)
+            register_reference(index, reference, 8)
         with self.assertRaises(UnknownReferenceError):
-            index.resolve(Reference.parse("base.ea.compact.immediate"))
+            resolve_reference(index, Reference.parse("base.ea.compact.immediate"))
 
     def test_index_membership_does_not_resolve_missing_references(self) -> None:
-        index = ReferenceIndex[int]()
+        index = {}
         existing = Reference.parse("base.field_types.Rn")
         missing = Reference.parse("base.field_types.Missing")
-        index.register(existing, 4)
+        register_reference(index, existing, 4)
 
+        index = ReferenceIndex(index)
         self.assertIn(existing, index)
         self.assertNotIn(missing, index)
         with self.assertRaises(ReferenceError):

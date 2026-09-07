@@ -1,17 +1,13 @@
-from pathlib import Path
+"""Place the selected RTL lowering outputs in this artifact's declared roles."""
 
-from artifacts._shared.systemverilog_decoder import SystemVerilogDecoderArtifactGenerator
-from engine.generation import ArtifactGenerationContext, GeneratedArtifactSet
+from artifacts._shared.systemverilog_decoder import rendered_decoder
+from artifacts._shared.systemverilog.artifacts import outputs
 
 
-class Generator(SystemVerilogDecoderArtifactGenerator):
-    def generate(self, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
-        rendered = self._render(self.project())
-        return self._outputs(
-            {
-                "d0-decoder": rendered[Path("bedrock_decode_d0.sv")],
-                "d1-decoder": rendered[Path("bedrock_decode_d1.sv")],
-            }
-        )
+def generate(definition, context):
+    rendered = rendered_decoder(context)
+    return outputs(definition, {'d0-decoder': rendered.d0, 'd1-decoder': rendered.d1})
 
-__all__ = ["Generator"]
+
+def validate(definition, context) -> None:
+    rendered_decoder(context)

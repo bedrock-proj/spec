@@ -11,8 +11,7 @@ function clause execute_uop(UopCalcEa(), uop, values, instruction, before, specu
                 faulted(before, instruction.form.operation, IllegalInstruction, "uop EA operand has no decoded EA"),
             ),
             Some(ea) => {
-                let plain = { ea with update_target = None(),  update_mode = None() };
-                let (evaluation, _) = evaluate_decoded_ea(operand, plain, speculative, before.pc, uop.width);
+                let (evaluation, _) = evaluate_decoded_ea(operand, ea, speculative, before.pc, uop.width);
                 let address : Uop_value = struct {
                         value = evaluation.effective_address,
                         secondary_value = 0x0000000000000000,
@@ -27,7 +26,7 @@ function clause execute_uop(UopCalcEa(), uop, values, instruction, before, specu
                         body_bytes = [||],
                         known = false,
                         present = false,
-                        address = true,
+                        address = ea.kind == EaKind_memory,
                         segment = evaluation.segment,
                         segment_image = evaluation.segment_image,
                         effective_address = evaluation.effective_address,

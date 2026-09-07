@@ -20,6 +20,33 @@ function fp_response_upper_zero_valid(response : Fp_response_image) -> bool =
     & response.secondary[63 .. 32] == 0x00000000
   else true
 
+function fp_response_expected_pre_dn_nan(request : Fp_request_image,
+                                         result_width : int) -> option(bits(64)) =
+  match fp_expected_pre_dn_nan(request, result_width) {
+    Some(converted) => match fp_semantics(request.operation) {
+      Some(semantics) => match semantics.exact_operation {
+        Some(FpExactAbsolute) => fp_bitwise_fabs(converted, result_width),
+        Some(FpExactNegate) => fp_bitwise_fneg(converted, result_width),
+        Some(FpExactMove) => fp_bitwise_fmov(converted, result_width),
+        _ => Some(converted),
+      },
+      None() => Some(converted),
+    },
+    None() => None(),
+  }
+
+function fp_response_pre_dn_nan_payload_valid(request : Fp_request_image,
+                                              result : Fp_operand_image) -> bool =
+  match fp_operand_class(result) {
+    Some(class) => if fp_class_is_nan(class) then
+      match fp_response_expected_pre_dn_nan(request, fp_operand_width(result)) {
+        Some(expected) => result.bits == expected,
+        None() => false,
+      }
+      else true,
+    None() => true,
+  }
+
 function fp_result_operand(kind : Fp_result_kind, bits : bits(64)) -> Fp_operand_image =
   struct {
     valid = true,
@@ -39,12 +66,12 @@ function fp_response_nan_origins_valid(request : Fp_request_image,
     let primary = fp_result_operand(response.result_kind, response.primary);
     let primary_valid = fp_nan_origin_valid(request, primary,
                                             response.primary_nan_origin)
-                        & fp_pre_dn_nan_payload_valid(request, primary);
+                        & fp_response_pre_dn_nan_payload_valid(request, primary);
     if fp_result_kind_is_pair(response.result_kind) then {
       let secondary = fp_result_operand(response.result_kind, response.secondary);
       primary_valid & fp_nan_origin_valid(request, secondary,
                                           response.secondary_nan_origin)
-      & fp_pre_dn_nan_payload_valid(request, secondary)
+      & fp_response_pre_dn_nan_payload_valid(request, secondary)
     }
     else primary_valid & response.secondary_nan_origin == FpNotNan
   }

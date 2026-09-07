@@ -56,6 +56,81 @@ static bool bedrock_core_vstatus_valid(uint64_t vstatus) {
          && selector != UINT64_C(1) && selector != UINT64_C(2);
 }
 
+static bool bedrock_core_response_kind_valid(int32_t kind) {
+  switch (kind) {
+    case zResponseTranslation:
+    case zResponseProbe:
+    case zResponseRead:
+    case zResponseWrite:
+    case zResponseStackRange:
+    case zResponseSegmentBounds:
+    case zResponseIntegerExternal:
+    case zResponseAtomic:
+    case zResponseAddressWake:
+    case zResponseAddressTranslation:
+    case zResponsePteRead:
+    case zResponseCacheMaintenance:
+    case zResponseFenceCompletion:
+    case zResponseTlbOperation:
+    case zResponseTranslationQuery:
+    case zResponseContextSwitch:
+    case zResponseRepeatFetch:
+    case zResponseEventFrame:
+    case zResponseCpuidQuery:
+    case zResponsePerformanceCounter:
+    case zResponseControlTransition:
+    case zResponseResetSerializze:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool bedrock_core_fault_kind_valid(int32_t kind) {
+  switch (kind) {
+    case zNoFault:
+    case zIllegalInstruction:
+    case zPrivilegeFault:
+    case zExtensionUnavailable:
+    case zInvalidControlState:
+    case zInvalidControlSelectorFault:
+    case zReservedControlBitsFault:
+    case zInvalidControlImageFault:
+    case zInvalidControlTransitionFault:
+    case zDivideByZero:
+    case zDivideOverflow:
+    case zBoundsFault:
+    case zAlignmentFault:
+    case zTranslationFault:
+    case zAccessFault:
+    case zEventFault:
+    case zFloatingPointFault:
+    case zVectorRangeFault:
+    case zCfiViolationFault:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool bedrock_core_access_class_valid(int32_t access_class) {
+  return access_class == zNormalAccess || access_class == zMmioAccess;
+}
+
+static bool bedrock_core_physical_class_valid(int32_t physical_class) {
+  return physical_class == zNormalPhysical || physical_class == zDevicePhysical;
+}
+
+static bool bedrock_core_response_shape_valid(
+    const bedrock_core_response *response) {
+  return bedrock_core_response_kind_valid(response->kind)
+         && bedrock_core_fault_kind_valid(response->fault_kind)
+         && bedrock_core_access_class_valid(response->access_class)
+         && bedrock_core_physical_class_valid(response->physical_class)
+         && response->flags <= UINT8_C(0x0F)
+         && response->generated_fflags <= UINT8_C(0x1F);
+}
+
 static bool bedrock_core_state_shape_valid(const struct zCpu_state *state) {
   if (state->zregisters.len != BEDROCK_CORE_REGISTER_COUNT
       || state->zfloating_registers.len != BEDROCK_CORE_FLOATING_REGISTER_COUNT
@@ -102,6 +177,10 @@ static bedrock_core_status bedrock_core_accept_execution(
     core->fault.operation = fault->zoperation;
     core->fault.error_code = fault->zerror_code;
     core->fault.bus_error = fault->zbus_error ? 1 : 0;
+    core->fault.address_valid = execution->zrequest.zkind != zNoPrimitiveRequest;
+    core->fault.effective_address = execution->zrequest.zeffective_address;
+    core->fault.linear_address = execution->zrequest.zlinear_address;
+    core->fault.width = mpz_get_si(execution->zrequest.zwidth);
     core->last_status = BEDROCK_CORE_FAULT;
   } else if (execution->zdebug_stop.kind == Kind_zSomezIRDebug_stopzK) {
     bedrock_core_discard_pending(core);
@@ -145,6 +224,10 @@ static bedrock_core_status bedrock_core_accept_execution(
     for (zz5listz8z5structz0zzMemory_access_rangez9 cursor = request->zmemory_ranges;
          cursor != NULL; cursor = cursor->tl)
       core->request.memory_range_count += 1;
+    core->request.validation_range_count = 0;
+    for (zz5listz8z5structz0zzMemory_validation_rangez9 cursor = request->zvalidation_ranges;
+         cursor != NULL; cursor = cursor->tl)
+      core->request.validation_range_count += 1;
     core->request.commit_point = request->zcommit_point ? 1 : 0;
     core->request.memory_order = mpz_get_si(request->zmemory_order);
     core->request.cache_policy = mpz_get_si(request->zcache_policy);
@@ -299,7 +382,8 @@ bedrock_core_status bedrock_core_get_control(
 
 bedrock_core_status bedrock_core_post_interrupt(
     bedrock_core *core, uint32_t identity) {
-  if (core == NULL) return BEDROCK_CORE_BAD_ARGUMENT;
+  if (core == NULL || identity > UINT32_C(0xFFFFFF))
+    return BEDROCK_CORE_BAD_ARGUMENT;
   struct zCpu_state updated;
   CREATE(zCpu_state)(&updated);
   zpost_interrupt(&updated, core->state, identity);
@@ -468,7 +552,16 @@ bedrock_core_status bedrock_core_set_state(
       || !bedrock_core_vstatus_valid(state->vstatus)
       || state->interrupt_max_id != core->state.zcontrols.zinterrupt_file.zmax_id
       || state->time_ticks_per_second != core->state.ztime.zticks_per_second
+      || state->cache_maintenance_granule
+             != (int64_t)core->state.zcache_maintenance_granule
       || state->interrupt_threshold > UINT64_C(0xFFFFFF)
+      || state->flags > UINT64_C(0xF)
+      || state->fflags > UINT64_C(0x1F)
+      || state->machine_check_payload > UINT64_C(0xFFFFFFFF)
+      || state->nmi_latched_source > UINT64_C(0xFFFFFF)
+      || state->nmi_relatched_source > UINT64_C(0xFFFFFF)
+      || state->repeat_condition > UINT64_C(0xF)
+      || state->repeat_counter > UINT64_C(0xF)
       || state->interrupt_selector > UINT64_C(0xFFFFF)
       || (state->interrupt_selector & UINT64_C(0x3FFFF))
            > core->state.zcontrols.zinterrupt_file.zmax_id / UINT64_C(64)
@@ -538,7 +631,6 @@ bedrock_core_status bedrock_core_set_state(
   core->state.zfp16_convert_enabled = state->fp16_convert_enabled != 0;
   core->state.zfptrans_enabled = state->fptrans_enabled != 0;
   core->state.zvector_enabled = state->vector_enabled != 0;
-  core->state.zcache_maintenance_granule = state->cache_maintenance_granule;
   core->state.zfp_state_modified = state->fp_state_modified != 0;
   core->state.zvector_state_modified = state->vector_state_modified != 0;
   mpz_set_si(core->state.zmax_vector_length_bytes,
@@ -653,6 +745,31 @@ bedrock_core_status bedrock_core_request_memory_ranges(
   return BEDROCK_CORE_NEEDS_ENVIRONMENT;
 }
 
+bedrock_core_status bedrock_core_request_validation_ranges(
+    const bedrock_core *core, bedrock_core_validation_range *buffer,
+    size_t capacity, size_t *count) {
+  if (core == NULL || count == NULL) return BEDROCK_CORE_BAD_ARGUMENT;
+  if (!core->has_pending || core->last_status != BEDROCK_CORE_NEEDS_ENVIRONMENT)
+    return core->last_status == BEDROCK_CORE_OK ? BEDROCK_CORE_BAD_STATE
+                                                : core->last_status;
+  size_t required = core->request.validation_range_count;
+  *count = required;
+  if (buffer == NULL && capacity == 0)
+    return BEDROCK_CORE_NEEDS_ENVIRONMENT;
+  if (required > capacity || (required != 0 && buffer == NULL))
+    return BEDROCK_CORE_BAD_ARGUMENT;
+  size_t index = 0;
+  for (zz5listz8z5structz0zzMemory_validation_rangez9 cursor =
+           core->pending.zrequest.zvalidation_ranges;
+       cursor != NULL; cursor = cursor->tl) {
+    buffer[index].effective_address = cursor->hd.zeffective_address;
+    buffer[index].linear_address = cursor->hd.zlinear_address;
+    buffer[index].width = mpz_get_si(cursor->hd.zwidth);
+    index += 1;
+  }
+  return BEDROCK_CORE_NEEDS_ENVIRONMENT;
+}
+
 bedrock_core_status bedrock_core_cancel(bedrock_core *core) {
   if (core == NULL) return BEDROCK_CORE_BAD_ARGUMENT;
   if (!core->has_pending) return BEDROCK_CORE_BAD_STATE;
@@ -666,7 +783,8 @@ bedrock_core_status bedrock_core_resume(
   if (core == NULL || response == NULL) return BEDROCK_CORE_BAD_ARGUMENT;
   if (!core->has_pending || core->last_status != BEDROCK_CORE_NEEDS_ENVIRONMENT)
     return BEDROCK_CORE_BAD_STATE;
-  if (response->body_length != 0 && response->body_bytes == NULL)
+  if (!bedrock_core_response_shape_valid(response)
+      || (response->body_length != 0 && response->body_bytes == NULL))
     return BEDROCK_CORE_BAD_ARGUMENT;
 
   struct zTransaction_response transaction;
@@ -675,6 +793,17 @@ bedrock_core_status bedrock_core_resume(
   transaction.zsuccess = response->success != 0;
   transaction.zfault_kind = (enum zFault_kind)response->fault_kind;
   mpz_set_si(transaction.zfault_cause, response->fault_cause);
+  if (response->fault_range_present) {
+    struct zMemory_validation_range range;
+    CREATE(zMemory_validation_range)(&range);
+    range.zeffective_address = response->fault_range.effective_address;
+    range.zlinear_address = response->fault_range.linear_address;
+    mpz_set_si(range.zwidth, response->fault_range.width);
+    zSomezIRMemory_validation_rangezK(&transaction.zfault_range, range);
+    KILL(zMemory_validation_range)(&range);
+  } else {
+    zNonezIRMemory_validation_rangezK(&transaction.zfault_range, UNIT);
+  }
   COPY(sail_string)(&transaction.zdetail,
                     response->detail == NULL ? "" : response->detail);
   transaction.zvalue = response->value;

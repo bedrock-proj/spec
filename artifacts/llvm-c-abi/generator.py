@@ -2,22 +2,17 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from types import MappingProxyType
+
 import re
 from typing import NamedTuple
 
-from abi.c.model import CAbiProject
-from abi.c.model.project import CallingConvention, LocationPolicy
-from engine.generation import (
-    ArtifactGenerationContext,
-    ArtifactGenerator,
-    GeneratedArtifact,
-    GeneratedArtifactSet,
-)
+from abi.c.model.project import LocationPolicy, ResolvedRegisterClass
+from abi.c.model.projection import CAbiProjection, project_c_abi
+from engine.artifacts.generate import ArtifactGenerationContext
+from engine.artifacts.definition import GeneratedArtifact, GeneratedArtifactSet
 
 
-_CALLING_CONV_OUTPUT = Path("BedrockGenCallingConv.td")
-_CATALOG_OUTPUT = Path("BedrockGenCABI.inc")
 _MACROS = (
     "BEDROCK_C_TYPE",
     "BEDROCK_C_CALLING_CONVENTION",
@@ -38,7 +33,7 @@ _MACROS = (
     "BEDROCK_C_ATOMIC_INSTRUCTION",
 )
 
-_LLVM_RETURN_TYPES = {
+_LLVM_RETURN_TYPES = MappingProxyType({
     "GENERAL_SCALAR": ("i1", "i8", "i16", "i32", "i64"),
     "FLOAT_SCALAR": ("f32", "f64"),
     "VECTOR_VALUE": (
@@ -51,14 +46,14 @@ _LLVM_RETURN_TYPES = {
         "nxv2f64",
     ),
     "PREDICATE_VALUE": ("nxv16i1", "nxv8i1", "nxv4i1", "nxv2i1"),
-}
+})
 _LLVM_RETURN_CLASS_ORDER = (
     "PREDICATE_VALUE",
     "VECTOR_VALUE",
     "FLOAT_SCALAR",
     "GENERAL_SCALAR",
 )
-_SPILLABLE_REGISTER_GROUPS = {"GPR", "FPR", "VECTOR", "PREDICATE"}
+_SPILLABLE_REGISTER_GROUPS = frozenset({"GPR", "FPR", "VECTOR", "PREDICATE"})
 
 
 class CallingConventionReturnRule(NamedTuple):
@@ -75,55 +70,51 @@ class CallingConventionProjection(NamedTuple):
     all_callee_saved: tuple[str, ...]
 
 
-class Generator(ArtifactGenerator):
-    """Project C ABI entities into LLVM-friendly generated includes."""
-
-    def generate(self, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
-        project = context.require_provider("abi.c")
-        if not isinstance(project, CAbiProject):
-            raise TypeError("abi.c provider must be a CAbiProject")
-        convention = project.calling_convention
-        _validate_llvm_projection(project, convention)
-        calling_convention = _project_calling_convention(
-            project, convention, context.workspace
-        )
-        return GeneratedArtifactSet(
-            (
-                GeneratedArtifact(
-                    _CALLING_CONV_OUTPUT,
-                    _render_calling_convention(calling_convention),
-                ),
-                GeneratedArtifact(
-                    _CATALOG_OUTPUT, _render_catalog(project, context.workspace)
-                ),
+def generate(definition, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
+    project = _inputs(context)
+    _validate_llvm_projection(project)
+    calling_convention = _project_calling_convention(project)
+    return GeneratedArtifactSet(
+        (
+            GeneratedArtifact(
+                definition.outputs["calling-convention"], _render_calling_convention(calling_convention)
             ),
-            self.artifact_id,
-        )
+            GeneratedArtifact(
+                definition.outputs["catalog"], _render_catalog(project)
+            ),
+        ),
+        definition.id,
+    )
 
 
-def _validate_llvm_projection(
-    project: CAbiProject, convention: CallingConvention
-) -> None:
+def _inputs(context) -> CAbiProjection:
+    project = context.workspace.require_provider("abi.c")
+    isa = context.workspace.require_provider("isa")
+    return context.shared_result((project_c_abi, id(project), id(isa)), lambda: project_c_abi(project, isa))
+
+
+def validate(definition, context) -> None:
+    project = _inputs(context)
+    _validate_llvm_projection(project)
+    _project_calling_convention(project)
+
+
+def _validate_llvm_projection(project: CAbiProjection) -> None:
+    convention = project.calling_convention
     classes = {
-        project.register_classes.resolve(reference).id
-        for reference in convention.register_classes
+        value.definition.id for value in convention.register_classes.values()
     }
     required_classes = {"GENERAL", "FLOATING", "VECTOR", "PREDICATE"}
     if classes != required_classes:
         raise ValueError(
-            f"{convention.source}: LLVM projection requires register classes "
+            f"{convention.definition.source}: LLVM projection requires register classes "
             f"{sorted(required_classes)}, got {sorted(classes)}"
         )
-    values = {
-        project.value_classes.resolve(reference).id: project.value_classes.resolve(
-            reference
-        )
-        for reference in convention.value_classes
-    }
+    values = {value.definition.id: value for value in project.value_classes}
     missing = set(_LLVM_RETURN_TYPES) - set(values)
     if missing:
         raise ValueError(
-            f"{convention.source}: LLVM return projection lacks value classes "
+            f"{convention.definition.source}: LLVM return projection lacks value classes "
             f"{sorted(missing)}"
         )
     expected_result_classes = {
@@ -133,58 +124,40 @@ def _validate_llvm_projection(
         "PREDICATE_VALUE": "PREDICATE",
     }
     for value_id, class_id in expected_result_classes.items():
-        policy = values[value_id].result
-        actual = (
-            "NONE"
-            if policy.register_class is None
-            else project.register_classes.resolve(policy.register_class).id
-        )
+        value = values[value_id]
+        policy = value.definition.result
+        actual = value.result_register_class.definition.id
         if policy.mode != "value" or policy.units != 1 or actual != class_id:
             raise ValueError(
-                f"{values[value_id].source}: LLVM return projection expects "
+                f"{value.definition.source}: LLVM return projection expects "
                 f"one {class_id} value register"
             )
 
 
-def _project_calling_convention(
-    project: CAbiProject, convention: CallingConvention, workspace
-) -> CallingConventionProjection:
-    classes = {
-        project.register_classes.resolve(
-            reference
-        ).id: project.register_classes.resolve(reference)
-        for reference in convention.register_classes
-    }
-    value_classes = {
-        project.value_classes.resolve(reference).id: project.value_classes.resolve(
-            reference
-        )
-        for reference in convention.value_classes
-    }
+def _project_calling_convention(project: CAbiProjection) -> CallingConventionProjection:
+    value_classes = {value.definition.id: value for value in project.value_classes}
     return_rules: list[CallingConventionReturnRule] = []
     for value_id in _LLVM_RETURN_CLASS_ORDER:
         value_class = value_classes[value_id]
-        result_register_class = value_class.result.register_class
-        if result_register_class is None:
-            raise ValueError(f"value class {value_class.id!r} has no result class")
-        register_class = classes[
-            project.register_classes.resolve(result_register_class).id
-        ]
+        result_register_class = value_class.result_register_class
         return_rules.append(
             CallingConventionReturnRule(
                 value_id,
                 _LLVM_RETURN_TYPES[value_id],
-                tuple(workspace.resolve(item).id for item in register_class.results),
+                tuple(item.id for item in result_register_class.results),
             )
         )
-    callee_saved = next(
-        item for item in convention.preservation if item.disposition == "callee_saved"
-    ).registers
-    all_callee_saved = tuple(workspace.resolve(item).id for item in callee_saved)
+    callee_saved = tuple(
+        register
+        for disposition, registers in project.preservation
+        if disposition == "callee_saved"
+        for register in registers
+    )
+    all_callee_saved = tuple(item.id for item in callee_saved)
     spillable = tuple(
-        workspace.resolve(item).id
+        item.id
         for item in callee_saved
-        if workspace.resolve(item).group in _SPILLABLE_REGISTER_GROUPS
+        if item.group in _SPILLABLE_REGISTER_GROUPS
     )
     return CallingConventionProjection(tuple(return_rules), spillable, all_callee_saved)
 
@@ -226,14 +199,11 @@ def _render_calling_convention(projection: CallingConventionProjection) -> str:
 
 
 def _callee_saved_record(name: str, names: tuple[str, ...]) -> list[str]:
-    lines = [f"def {name} : CalleeSavedRegs<", "  (add " + names[0] + ","]
-    for index in range(1, len(names)):
-        suffix = ")>;" if index == len(names) - 1 else ","
-        lines.append(f"       {names[index]}{suffix}")
-    return lines
+    members = " " + ", ".join(names) if names else ""
+    return [f"def {name} : CalleeSavedRegs<(add{members})>;"]
 
 
-def _render_catalog(project: CAbiProject, workspace) -> str:
+def _render_catalog(project: CAbiProjection) -> str:
     lines = [
         "//===-- BedrockGenCABI.inc - generated C ABI data --------*- C++ -*-===//",
         "//",
@@ -245,9 +215,7 @@ def _render_catalog(project: CAbiProject, workspace) -> str:
         "",
         *_macro_defaults(),
     ]
-    namespace = project.namespaces["base"]
-    for entity_id in namespace.type_inventory.declared:
-        item = namespace.types[entity_id]
+    for item in project.types:
         fixed = isinstance(item.size_bits, int)
         lines.append(
             "BEDROCK_C_TYPE("
@@ -267,103 +235,99 @@ def _render_catalog(project: CAbiProject, workspace) -> str:
         )
 
     convention = project.calling_convention
-    stack = convention.stack
+    stack = convention.definition.stack
     lines.append(
         "BEDROCK_C_CALLING_CONVENTION("
         + ", ".join(
             (
-                workspace.resolve(stack.pointer).id,
+                convention.stack_pointer.id,
                 _token(stack.growth),
                 str(stack.entry_alignment_bytes),
                 str(stack.first_argument_offset_bytes),
                 str(stack.argument_slot_bytes),
-                workspace.resolve(stack.sret_register).id,
+                convention.sret_register.id,
                 str(stack.red_zone_bytes),
             )
         )
         + ")"
     )
-    for reference in convention.register_classes:
-        register_class = project.register_classes.resolve(reference)
+    for resolved_class in convention.register_classes.values():
+        register_class = resolved_class.definition
         lines.append(
             f"BEDROCK_C_REGISTER_CLASS({register_class.id}, "
             f"{_token(register_class.assignment_order)}, "
             f"{register_class.tuple_alignment}, "
             f"{_token(register_class.exhaustion)})"
         )
-        for index, register in enumerate(register_class.arguments):
+        for index, register in enumerate(resolved_class.arguments):
             lines.append(
                 f"BEDROCK_C_ARGUMENT_REGISTER({register_class.id}, {index}, "
-                f"{workspace.resolve(register).id})"
+                f"{register.id})"
             )
-        for index, register in enumerate(register_class.results):
+        for index, register in enumerate(resolved_class.results):
             lines.append(
                 f"BEDROCK_C_RESULT_REGISTER({register_class.id}, {index}, "
-                f"{workspace.resolve(register).id})"
+                f"{register.id})"
             )
-    for value_class_reference in convention.value_classes:
-        value_class = project.value_classes.resolve(value_class_reference)
+    for resolved_value in project.value_classes:
+        value_class = resolved_value.definition
         lines.append(f"BEDROCK_C_VALUE_CLASS({value_class.id})")
         for kind in value_class.kinds:
             lines.append(f"BEDROCK_C_VALUE_KIND({value_class.id}, {_token(kind)})")
         lines.append(
-            _location_line(project, value_class.id, "ARGUMENT", value_class.argument)
+            _location_line(value_class.id, "ARGUMENT", value_class.argument, resolved_value.argument_register_class)
         )
         lines.append(
-            _location_line(project, value_class.id, "RESULT", value_class.result)
+            _location_line(value_class.id, "RESULT", value_class.result, resolved_value.result_register_class)
         )
-    for promotion_reference in convention.promotions:
-        promotion = project.promotions.resolve(promotion_reference)
+    for promotion in project.promotions:
         for source_kind in promotion.source_kinds:
             lines.append(
                 f"BEDROCK_C_PROMOTION({promotion.id}, {_token(source_kind)}, "
                 f"{_token(promotion.target_kind)})"
             )
-    for preservation in convention.preservation:
-        for register in preservation.registers:
+    for disposition, registers in project.preservation:
+        for register in registers:
             lines.append(
                 f"BEDROCK_C_PRESERVATION_REGISTER("
-                f"{_token(preservation.disposition)}, {workspace.resolve(register).id})"
+                f"{_token(disposition)}, {register.id})"
             )
 
-    for entity_id in namespace.runtime_helper_inventory.declared:
-        helper = namespace.runtime_helpers[entity_id]
+    for helper, result, parameters in project.runtime_helpers:
         lines.append(
             f"BEDROCK_C_RUNTIME_HELPER({helper.id}, {_c_string(helper.symbol)}, "
-            f"{project.types.resolve(helper.result).id})"
+            f"{result.id})"
         )
-        for index, parameter in enumerate(helper.parameters):
+        for index, parameter in enumerate(parameters):
             lines.append(
                 f"BEDROCK_C_RUNTIME_PARAMETER({helper.id}, {index}, "
-                f"{project.types.resolve(parameter).id})"
+                f"{parameter.id})"
             )
 
-    for entity_id in namespace.memory_order_inventory.declared:
-        mapping = namespace.memory_orders[entity_id]
+    for mapping, load, store, thread_fence in project.memory_orders:
         lines.append(
             f"BEDROCK_C_MEMORY_ORDER({mapping.id}, "
             f"{_token(mapping.instruction_order)}, "
             f"{int(mapping.load is not None)}, {int(mapping.store is not None)})"
         )
         for operation, sequence in (
-            ("LOAD", mapping.load),
-            ("STORE", mapping.store),
-            ("THREAD_FENCE", mapping.thread_fence),
+            ("LOAD", load),
+            ("STORE", store),
+            ("THREAD_FENCE", thread_fence),
         ):
             for index, step in enumerate(sequence or ()):
                 kind = "ACCESS" if step == "access" else "INSTRUCTION"
                 value = (
                     "NONE"
                     if step == "access"
-                    else workspace.resolve(step).instruction.mnemonic
+                    else step.instruction.mnemonic
                 )
                 lines.append(
                     f"BEDROCK_C_MEMORY_ORDER_STEP({mapping.id}, {operation}, "
                     f"{index}, {kind}, {value})"
                 )
 
-    for entity_id in namespace.atomic_lowering_inventory.declared:
-        lowering = namespace.atomic_lowerings[entity_id]
+    for lowering, instructions in project.atomic_lowerings:
         lines.append(
             f"BEDROCK_C_ATOMIC_LOWERING({lowering.id}, {_token(lowering.strategy)})"
         )
@@ -371,10 +335,10 @@ def _render_catalog(project: CAbiProject, workspace) -> str:
             lines.append(
                 f"BEDROCK_C_ATOMIC_OPERATION({lowering.id}, {_token(operation)})"
             )
-        for index, instruction in enumerate(lowering.instructions):
+        for index, instruction in enumerate(instructions):
             lines.append(
                 f"BEDROCK_C_ATOMIC_INSTRUCTION({lowering.id}, {index}, "
-                f"{workspace.resolve(instruction).instruction.mnemonic})"
+                f"{instruction.instruction.mnemonic})"
             )
     lines.extend(_macro_cleanup())
     lines.append("")
@@ -382,16 +346,12 @@ def _render_catalog(project: CAbiProject, workspace) -> str:
 
 
 def _location_line(
-    project: CAbiProject, value_class: str, direction: str, policy: LocationPolicy
+    value_class: str, direction: str, policy: LocationPolicy, resolved_class: ResolvedRegisterClass
 ) -> str:
-    register_class = (
-        "NONE"
-        if policy.register_class is None
-        else project.register_classes.resolve(policy.register_class).id
-    )
+    register_class = resolved_class.definition.id
     return (
         f"BEDROCK_C_LOCATION_POLICY({value_class}, {direction}, "
-        f"{_token(policy.mode)}, {register_class}, {policy.units or 0}, "
+        f"{_token(policy.mode)}, {register_class}, {policy.units}, "
         f"{policy.alignment_units}, {policy.direct_maximum_bytes or 0})"
     )
 
@@ -435,7 +395,12 @@ def _token(value: str) -> str:
 
 
 def _c_string(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-__all__ = ["Generator"]
+    escaped = []
+    for character in value:
+        if character in ('\\', '"', '?'):
+            escaped.append('\\' + character)
+        elif ord(character) < 32 or ord(character) == 127:
+            escaped.append(f"\\{ord(character):03o}")
+        else:
+            escaped.append(character)
+    return '"' + ''.join(escaped) + '"'

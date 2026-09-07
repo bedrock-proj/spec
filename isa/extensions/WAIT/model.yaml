@@ -1,4 +1,5 @@
 sail:
+  instruction_set: WaitSet
   units:
   - id: execution
     requires:

@@ -1,4 +1,6 @@
 sail:
+  instruction_set: VectorSet
+  fault_kinds: [VectorRangeFault]
   units:
   - id: execution
     requires:

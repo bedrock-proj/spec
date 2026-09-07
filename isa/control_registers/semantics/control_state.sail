@@ -151,7 +151,7 @@ function target_probe_request(ordinal : int, segment_image : bits(64), target : 
     range_end_at_modulus = target == 0xFFFFFFFFFFFFFFFF,
     linear_address = point.linear, access = AccessExecute, value = 0x0000000000000000,
     address_translation = true, debug_validation = false, debug_validated = false,
-    physical_address = 0x0000000000000000, memory_ranges = [||],
+    physical_address = 0x0000000000000000, memory_ranges = [||], validation_ranges = [||],
     read_completion = ReadCompletionData, memory_cache_hint = MemoryCacheDefault,
     commit_point = false, memory_order = ordinal,
     cache_policy = 0, suppress_fault = false, staged_updates = [||],

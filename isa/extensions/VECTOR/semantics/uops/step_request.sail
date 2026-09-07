@@ -227,6 +227,11 @@ function vector_step_request(
             width = element_bytes,
             buffer_offset = 0,
         }|],
+        validation_ranges = [|struct {
+            effective_address = address,
+            linear_address = point.linear,
+            width = element_bytes,
+        }|],
         read_completion = ReadCompletionData,
         memory_cache_hint = MemoryCacheDefault,
         commit_point = true,

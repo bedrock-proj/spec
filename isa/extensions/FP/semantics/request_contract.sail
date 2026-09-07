@@ -136,17 +136,26 @@ function fp_request_width(request : Fp_request_image) -> int = {
   request.operation_width
 }
 
-function fp_operand_needs_format_conversion(operand : Fp_operand_image,
-                                            result_kind : Fp_result_kind) -> bool = {
-  let result_width = fp_result_kind_width(result_kind);
-  operand.valid & result_width != 0 & fp_operand_width(operand) != 0
-  & fp_operand_width(operand) != result_width
-}
+function fp_operation_has_intrinsic_conversion(operation : Semantic_operation) -> bool =
+  match fp_semantics(operation) {
+    Some(semantics) => semantics.conversion_unsigned != None(),
+    None() => false,
+  }
+
+function fp_operand_needs_format_conversion(operation : Semantic_operation,
+                                            operation_width : int,
+                                            operand : Fp_operand_image) -> bool =
+  not_bool(fp_operation_has_intrinsic_conversion(operation))
+  & operand.valid & fp_operand_width(operand) != 0
+  & fp_operand_width(operand) != operation_width
 
 function fp_request_needs_format_conversion(request : Fp_request_image) -> bool =
-  fp_operand_needs_format_conversion(request.operand0, request.result_kind)
-  | fp_operand_needs_format_conversion(request.operand1, request.result_kind)
-  | fp_operand_needs_format_conversion(request.operand2, request.result_kind)
+  fp_operand_needs_format_conversion(request.operation, request.operation_width,
+                                     request.operand0)
+  | fp_operand_needs_format_conversion(request.operation, request.operation_width,
+                                       request.operand1)
+  | fp_operand_needs_format_conversion(request.operation, request.operation_width,
+                                       request.operand2)
 
 function fp_request_is_exact_local(request : Fp_request_image) -> bool =
   fp_operation_is_exact_local(request.operation)
@@ -247,10 +256,11 @@ function fp_request_valid(request : Fp_request_image) -> bool =
 
 function fp_prepare_request_operand(operation : Semantic_operation,
                                     operand : Fp_operand_image,
-                                    result_kind : Fp_result_kind,
+                                    operation_width : int,
                                     daz : bool) -> Fp_operand_image =
   if fp_operation_is_exact_local(operation)
-     & not_bool(fp_operand_needs_format_conversion(operand, result_kind))
+     & not_bool(fp_operand_needs_format_conversion(operation, operation_width,
+                                                   operand))
   then operand
   else fp_apply_daz(operand, daz)
 
@@ -265,13 +275,13 @@ function fp_build_request(operation : Semantic_operation, form : Catalog_entry,
       let daz = fp_fstatus_daz(fstatus);
       let prepared : Fp_operand_slots = struct {
         operand0 = fp_prepare_request_operand(
-          operation, operands.operand0, result_kind, daz
+          operation, operands.operand0, operation_width, daz
         ),
         operand1 = fp_prepare_request_operand(
-          operation, operands.operand1, result_kind, daz
+          operation, operands.operand1, operation_width, daz
         ),
         operand2 = fp_prepare_request_operand(
-          operation, operands.operand2, result_kind, daz
+          operation, operands.operand2, operation_width, daz
         )
       };
       let base_request : Fp_request_image = struct {

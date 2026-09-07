@@ -1,4 +1,7 @@
 sail:
+  instruction_set: FpuSet
+  fault_kinds: [FloatingPointFault]
+  effect_kinds: [FloatingPointCompute]
   units:
   - id: contract
     requires:

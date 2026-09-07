@@ -1,10 +1,17 @@
+from importlib import import_module
 import unittest
 from pathlib import PurePosixPath
 
-from engine.site.model import ROOT_PAGE_KEY, SiteModel
-from engine.site.navigation import NavigationGroup, PageRegistry, PageSpec
-from engine.site.structure import parse_latex_structure
-from engine.site.visual import extract_visuals
+ROOT_PAGE_KEY = import_module("artifacts.web-reference.site.model").ROOT_PAGE_KEY
+NavigationGroup = import_module(
+    "artifacts.web-reference.site.navigation"
+).NavigationGroup
+PageRegistry = import_module("artifacts.web-reference.site.navigation").PageRegistry
+PageSpec = import_module("artifacts.web-reference.site.navigation").PageSpec
+parse_latex_structure = import_module(
+    "artifacts.web-reference.site.structure"
+).parse_latex_structure
+extract_visuals = import_module("artifacts.web-reference.site.visual").extract_visuals
 
 
 class WebReferenceTest(unittest.TestCase):
@@ -36,28 +43,27 @@ class WebReferenceTest(unittest.TestCase):
         )
 
     def test_navigation_projects_each_owned_page_once(self) -> None:
-        registry = PageRegistry()
-        registry.add_page(
-            PageSpec(ROOT_PAGE_KEY, "Home", PurePosixPath("index.md"))
-        )
-        registry.add_page(
+        pages = []
+        pages.append(PageSpec(ROOT_PAGE_KEY, "Home", PurePosixPath("index.md")))
+        pages.append(
             PageSpec(
                 "guide:landing",
                 "Guide",
                 PurePosixPath("guide/index.md"),
                 group="guide",
-            )
+            ),
         )
-        registry.add_page(
+        pages.append(
             PageSpec(
                 "guide:topic",
                 "Topic",
                 PurePosixPath("guide/topic.md"),
                 group="guide",
                 parent="guide:landing",
-            )
+            ),
         )
-        site = SiteModel(registry, (NavigationGroup("guide", "Guide"),))
+        registry = PageRegistry(pages)
+        groups = (NavigationGroup("guide", "Guide"),)
 
         def outputs(entries: list[dict[str, object]]) -> list[str]:
             projected: list[str] = []
@@ -71,10 +77,11 @@ class WebReferenceTest(unittest.TestCase):
                     self.fail(f"unexpected navigation entry: {entry!r}")
             return projected
 
-        projected = outputs(site.navigation())
+        projected = outputs(registry.navigation(ROOT_PAGE_KEY, groups))
         owned = [page.output.as_posix() for page in registry.pages]
 
         self.assertEqual(sorted(projected), sorted(owned))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,7 @@ encodings:
   q_8_sp:
     pattern: '0001110'
     syntax: ADD.Q 8, SP
+    fixed_operand_roles: [imm, dst]
   l_q_z_rn_s_rn_d:
     pattern: 00001zssssdddd
     syntax: ADD.{L|Q}(z) Rn(s), Rn(d)
@@ -18,6 +19,7 @@ encodings:
   q_imm8_i_sp:
     pattern: 100011iiiiiiii
     syntax: ADD.Q imm8(i), SP
+    fixed_operand_roles: [dst]
     fields:
       i:
         role: imm
@@ -25,12 +27,14 @@ encodings:
   q_imm16s_sp:
     pattern: '111011110000000000'
     syntax: ADD.Q <imm16s>, SP
+    fixed_operand_roles: [dst]
     payloads:
     - role: imm
       type: base.payload_types.IMM16S
   q_imm32s_sp:
     pattern: '111011110000000001'
     syntax: ADD.Q <imm32s>, SP
+    fixed_operand_roles: [dst]
     payloads:
     - role: imm
       type: base.payload_types.IMM32S

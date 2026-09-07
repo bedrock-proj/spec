@@ -27,6 +27,10 @@ encodings:
       z: {role: size, type: FP.field_types.SIZE_BWLQ}
       e: {role: src, type: FP.field_types.FEA}
       d: {role: dst, type: FP.field_types.Fn}
+    constraints:
+    - role: src
+      exclude: [immediate]
+      reason: invalid_source
   b_w_l_q_z_fn_s_ea_e:
     pattern: 1111101100011zzsssseeeeeee
     syntax: FCVTH.{B|W|L|Q}(z) Fn(s), <ea>(e)

@@ -1,66 +1,82 @@
+"""Canonical EA selection and architected evaluation order."""
+
 import unittest
 from pathlib import Path
 
-from engine.ea_mode import EAMode, EAModeCatalog
-from engine.generate_ea_diagrams import catalog_mode_paths, project_mode
-from engine.type_system import TypeSystem
+from engine.documents.fragments.ea import project_mode, select_ea_diagram
+from engine.isa.ea import (
+    EAAutoupdate, EABaseSource, EABinary, EACalculate, EACapture, EAEncoding,
+    EAField, EAIdentifier, EAModeCatalog, EAPayload, EARegisterUpdate,
+    MemoryEAMode,
+)
+from engine.isa.model import DocumentTopic
+from engine.isa.types import ImmediatePayloadType, RegisterFieldType
+from engine.reference import Reference, ReferenceIndex
+
+
+def _mode(update=None, owner="base"):
+    root = Path("/synthetic")
+    register_type = RegisterFieldType(Reference(owner, ("field_types",), "Rn"), root / "field_types.yaml", owner, "Rn", 3, Reference(owner, ("register_groups",), "GENERAL"))
+    payload_type = ImmediatePayloadType(Reference(owner, ("payload_types",), "DISP"), root / "payload_types.yaml", owner, "DISP", 2, "signed_integer")
+    fields = (EAField("b", "base", register_type.reference), EAField("i", "index", register_type.reference))
+    payload = EAPayload("displacement", payload_type.reference)
+    encoding = EAEncoding(("00bbbiii",), (payload,), update)
+    catalog = EAModeCatalog(root / "modes.yaml", owner, "Ea", "extension", "Address modes", ("indexed",))
+    expression = EABinary("+", EABinary("+", EAIdentifier("base"), EAIdentifier("index")), EAIdentifier("displacement"))
+    mode = MemoryEAMode(catalog.reference("indexed"), root / "indexed/mode.yaml", catalog, "indexed", "Indexed", (encoding,), fields, "[Rn(b) + Rn(i) + displacement]", expression, None, EABaseSource.ENCODED)
+    return mode, register_type, payload_type
 
 
 class GenerateEADiagramsTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.isa_root = Path(__file__).parents[1] / "isa"
-        cls.types = TypeSystem.load(cls.isa_root)
+    def test_selected_encoding_preserves_canonical_bindings_and_declared_widths(self):
+        mode, field_type, payload_type = _mode()
+        projection = project_mode(mode, mode.encodings[0], field_types=ReferenceIndex({field_type.reference: field_type}), payload_types=ReferenceIndex({payload_type.reference: payload_type}))
+        resolved, = projection.encodings
+        self.assertIs(projection.mode, mode)
+        self.assertIs(resolved.encoding, mode.encodings[0])
+        for binding, field in zip(resolved.fields, mode.fields, strict=True):
+            self.assertIs(binding.field, field)
+            self.assertIs(binding.definition, field_type)
+        self.assertEqual(tuple(binding.positions for binding in resolved.fields), ((5, 4, 3), (2, 1, 0)))
+        self.assertEqual(resolved.pattern.bit_width, 8)
+        self.assertIs(resolved.payloads[0].payload, mode.encodings[0].payloads[0])
+        self.assertIs(resolved.payloads[0].definition, payload_type)
+        self.assertEqual(resolved.payload_width, 16)
 
-    def load(self, relative: str) -> EAMode:
-        return EAMode.load(self.isa_root / relative, self.isa_root, self.types)
+    def test_predecrement_happens_before_capture_of_updated_base(self):
+        update = EAAutoupdate("base", "predecrement", 8)
+        mode, field_type, payload_type = _mode(update)
+        projection = project_mode(mode, field_types=ReferenceIndex({field_type.reference: field_type}), payload_types=ReferenceIndex({payload_type.reference: payload_type}))
+        steps, = projection.evaluation
+        self.assertEqual(tuple(type(step) for step in steps), (EARegisterUpdate, EACapture, EACapture, EACapture, EACalculate))
+        self.assertIs(steps[0].update, update)
+        self.assertIs(steps[0].binding.field, mode.fields[0])
+        self.assertIs(steps[1].binding.field, mode.fields[0])
+        self.assertIs(steps[2].binding.field, mode.fields[1])
+        self.assertIs(steps[3].binding.payload, mode.encodings[0].payloads[0])
+        self.assertIs(steps[4].expression, mode.expression)
 
-    def test_catalog_paths_are_the_declared_mode_inventory(self) -> None:
-        catalogs = EAModeCatalog.discover(self.isa_root, self.types)
-        expected = tuple(
-            catalog.mode_path(mode_id)
-            for catalog in catalogs
-            for mode_id in catalog.modes
-        )
+    def test_postincrement_happens_after_capture_and_before_next_operand(self):
+        update = EAAutoupdate("base", "postincrement", 8)
+        mode, field_type, payload_type = _mode(update)
+        projection = project_mode(mode, field_types=ReferenceIndex({field_type.reference: field_type}), payload_types=ReferenceIndex({payload_type.reference: payload_type}))
+        steps, = projection.evaluation
+        self.assertEqual(tuple(type(step) for step in steps), (EACapture, EARegisterUpdate, EACapture, EACapture, EACalculate))
+        self.assertIs(steps[0].binding.field, mode.fields[0])
+        self.assertIs(steps[1].update, update)
+        self.assertIs(steps[2].binding.field, mode.fields[1])
 
-        self.assertEqual(tuple(catalog_mode_paths(self.isa_root)), expected)
+    def test_owner_local_selection_returns_the_canonical_mode(self):
+        mode, field_type, payload_type = _mode()
+        topic = DocumentTopic("base", "address", Reference("base", ("topics",), "address"), Path("/synthetic/model.yaml"), Path("/synthetic/address.tex"))
+        selected = select_ea_diagram(mode.reference, owner=topic, modes=ReferenceIndex({mode.reference: mode}), field_types=ReferenceIndex({field_type.reference: field_type}), payload_types=ReferenceIndex({payload_type.reference: payload_type}))
+        self.assertIs(selected.mode, mode)
 
-    def test_mode_projection_preserves_declared_encoding_relations(self) -> None:
-        for path in catalog_mode_paths(self.isa_root):
-            with self.subTest(mode=path):
-                mode = EAMode.load(path, self.isa_root, self.types)
-                projection = project_mode(mode)
-                updates = tuple(
-                    index
-                    for index, encoding in enumerate(mode.encodings)
-                    if encoding.autoupdate is not None
-                )
-
-                self.assertEqual(
-                    tuple(
-                        update.encoding_index for update in projection.autoupdates
-                    ),
-                    updates,
-                )
-                self.assertTrue(
-                    all(
-                        projection.encodings[update.encoding_index].autoupdate
-                        is update
-                        for update in projection.autoupdates
-                    )
-                )
-                self.assertEqual(
-                    tuple(
-                        sum(field.bits for field in encoding.fields)
-                        for encoding in projection.encodings
-                    ),
-                    tuple(
-                        len(
-                            "".join(patterns)
-                        )
-                        for patterns in (encoding.patterns for encoding in mode.encodings)
-                    ),
-                )
+    def test_foreign_mode_selection_is_rejected(self):
+        mode, field_type, payload_type = _mode(owner="OTHER")
+        topic = DocumentTopic("base", "address", Reference("base", ("topics",), "address"), Path("/synthetic/model.yaml"), Path("/synthetic/address.tex"))
+        with self.assertRaises(ValueError):
+            select_ea_diagram(mode.reference, owner=topic, modes=ReferenceIndex({mode.reference: mode}), field_types=ReferenceIndex({field_type.reference: field_type}), payload_types=ReferenceIndex({payload_type.reference: payload_type}))
 
 
 if __name__ == "__main__":

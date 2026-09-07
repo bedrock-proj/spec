@@ -6,23 +6,31 @@ struct Decoded_field = {
   value : int,
 }
 
+struct Decoded_ea_payload = {
+  definition : Ea_payload,
+  value : bits(64),
+}
+
+struct Decoded_payload = {
+  operand_name : Operand_id,
+  value : bits(64),
+}
+
 struct Decoded_ea = {
   compact_name : Ea_form_id,
   profile : Ea_profile,
   kind : Ea_kind,
   segment : option(Ea_segment),
   base : option(Ea_base),
+  expression : Ea_expression,
   operand_width : option(Ea_width),
   descriptor_name : option(Ea_form_id),
   raw : int,
   descriptor_bytes : int,
   fields : list(Decoded_field),
-  payload : bits(64),
-  payload_width : int,
-  payload_signed : bool,
-  update_target : option(Ea_update_target),
-  update_mode : option(Ea_update_mode),
-  update_difference : option(Ea_update_difference),
+  payload_layout : list(Ea_payload),
+  payloads : list(Decoded_ea_payload),
+  autoupdates : list(Ea_autoupdate),
 }
 
 struct Decoded_operand = {
@@ -48,6 +56,11 @@ struct Ea_parse = {
 
 struct Operand_parse = {
   operands : list(Decoded_operand),
+  cursor : int,
+}
+
+struct Payload_parse = {
+  payloads : list(Decoded_payload),
   cursor : int,
 }
 

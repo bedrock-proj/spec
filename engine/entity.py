@@ -5,11 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-import re
 from types import MappingProxyType
 from typing import Iterable, Mapping, cast
 
-from .reference import Reference, ReferenceIndex
+from engine.reference import (
+    QualifiedReference,
+    Reference,
+    ReferenceIndex,
+    register_reference,
+)
 
 
 class EntityDisplayStyle(StrEnum):
@@ -39,95 +43,59 @@ class EntityCatalog:
     references: ReferenceIndex[Entity]
     presentations: Mapping[Reference[Entity], EntityPresentation]
 
-    @classmethod
-    def create(
-        cls,
-        entries: Iterable[
-            tuple[Entity, str, EntityDisplayStyle]
-            | tuple[Entity, str]
-        ],
-    ) -> "EntityCatalog":
-        references = ReferenceIndex[Entity]()
-        presentations: dict[Reference[Entity], EntityPresentation] = {}
-        for entry in entries:
-            entity, display = entry[:2]
-            style = (
-                entry[2]
-                if len(entry) == 3
-                else EntityDisplayStyle.TEXT
-            )
-            if not isinstance(entity, Entity):
-                raise TypeError("entity catalog entries must inherit Entity")
-            if not isinstance(entity.reference, Reference):
-                raise TypeError("entity reference must be a Reference")
-            if not isinstance(entity.source, Path):
-                raise TypeError("entity source must be a Path")
-            reference = cast(Reference[Entity], entity.reference)
-            references.register(reference, entity)
-            presentations[reference] = EntityPresentation(display, style)
-        return cls(references, MappingProxyType(presentations))
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.references, ReferenceIndex):
+            object.__setattr__(self, "references", ReferenceIndex(self.references))
+        object.__setattr__(self, "presentations", MappingProxyType(dict(self.presentations)))
+        if set(self.references) != set(self.presentations):
+            raise ValueError("entity presentations and references must have identical membership")
+        for reference, entity in self.references.items():
+            if not isinstance(entity, Entity) or not isinstance(entity.source, Path):
+                raise TypeError("entity catalog members require Entity identity and source provenance")
+            if entity.reference != reference:
+                raise ValueError("entity index key differs from member identity")
+            if not isinstance(self.presentations[reference], EntityPresentation):
+                raise TypeError("entity presentation must be an EntityPresentation")
 
     def resolve(self, reference: Reference[Entity]) -> Entity:
         return self.references.resolve(reference)
 
-    def presentation(
-        self, reference: Reference[object]
-    ) -> EntityPresentation:
+    def presentation(self, reference: Reference[object]) -> EntityPresentation:
         normalized = cast(Reference[Entity], reference)
         self.resolve(normalized)
         return self.presentations[normalized]
 
 
+
+
 @dataclass(frozen=True, slots=True)
-class PublicTargetCatalog:
-    """The entity targets deliberately emitted by one public projector."""
+class EntityDependency:
+    """One provider-owned authored or structured relationship."""
 
-    entities: EntityCatalog
-    labels: Mapping[Reference[Entity], str]
-
-    @classmethod
-    def create(
-        cls,
-        entities: EntityCatalog,
-        targets: Iterable[tuple[Reference[object], str]],
-    ) -> "PublicTargetCatalog":
-        labels: dict[Reference[Entity], str] = {}
-        owners: dict[str, Reference[Entity]] = {}
-        for reference, label in targets:
-            normalized = cast(Reference[Entity], reference)
-            entities.resolve(normalized)
-            previous = labels.get(normalized)
-            if previous is not None and previous != label:
-                raise ValueError(
-                    f"public entity target {normalized!r} has conflicting labels"
-                )
-            owner = owners.get(label)
-            if owner is not None and owner != normalized:
-                raise ValueError(
-                    f"public TeX label {label!r} is shared by distinct entities"
-                )
-            labels[normalized] = label
-            owners[label] = normalized
-        return cls(entities, MappingProxyType(labels))
-
-    def resolve(self, reference: Reference[Entity]) -> tuple[Entity, str]:
-        try:
-            label = self.labels[reference]
-        except KeyError as error:
-            raise ValueError(
-                f"entity {reference!r} has no target in this public projection"
-            ) from error
-        return self.entities.resolve(reference), label
-
-    def label(self, reference: Reference[object]) -> str:
-        normalized = cast(Reference[Entity], reference)
-        return self.resolve(normalized)[1]
+    source: Reference[object]
+    target: QualifiedReference[object]
+    kind: str
 
 
-    def contains(self, reference: Reference[object]) -> bool:
-        return cast(Reference[Entity], reference) in self.labels
-
-
-def instruction_label(mnemonic: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", mnemonic.lower()).strip("-")
-    return f"instr:{slug}"
+def create_entity_catalog(
+    entries: Iterable[tuple[Entity, str, EntityDisplayStyle] | tuple[Entity, str]],
+) -> "EntityCatalog":
+    references = {}
+    presentations: dict[Reference[Entity], EntityPresentation] = {}
+    for entry in entries:
+        entity, display = entry[:2]
+        style = entry[2] if len(entry) == 3 else EntityDisplayStyle.TEXT
+        if not isinstance(entity, Entity):
+            raise TypeError("entity catalog entries must inherit Entity")
+        if not isinstance(entity.reference, Reference):
+            raise TypeError("entity reference must be a Reference")
+        if not isinstance(entity.source, Path):
+            raise TypeError("entity source must be a Path")
+        reference = cast(Reference[Entity], entity.reference)
+        register_reference(references, reference, entity)
+        presentations[reference] = EntityPresentation(display, style)
+    return EntityCatalog(
+        references=ReferenceIndex(references),
+        presentations=MappingProxyType(presentations),
+    )

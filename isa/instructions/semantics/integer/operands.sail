@@ -17,20 +17,17 @@ function immediate_value(operand : Decoded_operand) -> bits(64) =
   else if operand.operand_type == OperandType_imm32s then sail_sign_extend(operand.value[31 .. 0], 64)
   else operand.value
 
-function local_ea_value(state : Cpu_state, ea : Decoded_ea) -> option(bits(64)) =
-  if ea.kind == EaKind_immediate then
-    if ea.payload_signed then Some(sign_extend_width(ea.payload, tdiv_int(ea.payload_width, 8)))
-    else Some(ea.payload)
-  else None()
-
-function local_operand_value(state : Cpu_state, operand : Decoded_operand) -> option(bits(64)) =
+function local_operand_value(state : Cpu_state, operand : Decoded_operand, width : int) -> option(bits(64)) =
   if operand.operand_type == OperandType_Rn then Some(state.registers[unsigned(operand.value[3 .. 0])])
   else if operand.operand_type == OperandType_SP then Some(state.sp)
   else if operand.operand_type == OperandType_CS then Some(state.segments[0])
   else if operand.operand_type == OperandType_SREG then
     Some(state.segments[unsigned(operand.value[2 .. 0]) + 1])
   else if operand.operand_type == OperandType_EA then match operand.ea {
-    Some(ea) => local_ea_value(state, ea),
+    Some(ea) => if ea.kind == EaKind_immediate then {
+      let (evaluation, _) = evaluate_decoded_ea(operand, ea, state, state.pc, width);
+      Some(evaluation.value)
+    } else None(),
     None() => None(),
   }
   else Some(immediate_value(operand))
@@ -74,7 +71,7 @@ function operand_ordinal(instruction : Decoded_instruction, name : Operand_id) -
 function value_named(instruction : Decoded_instruction, state : Cpu_state,
                      name : Operand_id) -> option(bits(64)) =
   match operand_named(instruction, name) {
-    Some(operand) => local_operand_value(state, operand),
+    Some(operand) => local_operand_value(state, operand, instruction_ea_width(operand, operation_width(instruction))),
     None() => None(),
   }
 

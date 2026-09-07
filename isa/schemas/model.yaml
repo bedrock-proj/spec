@@ -21,6 +21,12 @@ properties:
         items:
           type: string
           pattern: ^[A-Z][A-Za-z0-9]*$
+      effect_kinds:
+        type: array
+        uniqueItems: true
+        items:
+          type: string
+          pattern: ^[A-Z][A-Za-z0-9]*$
       units:
         type: array
         items:
@@ -83,6 +89,7 @@ x-interpretation-rules:
 - sail.units are executable dependency nodes; each owns one or more ordered Sail sources.
 - sail.instruction_set optionally declares the Sail Instruction_set constructor owned by an extension namespace.
 - sail.fault_kinds declares Fault_kind constructors contributed by the owner to selected executable models.
+- sail.effect_kinds declares Effect_kind constructors contributed by the owner to selected executable models.
 - sail.execution_provider is an optional owner-local Sail source that implements the final execute_operation_entry, cpuid_flag_enabled, and event_from_fault boundaries after generated instruction dispatch.
 - A selected configuration has at most one execution provider; without one, generated adapters implement all three boundaries directly from the base semantics.
 - documents.topics are owner-local TeX sources; each file owns one available subtopic.

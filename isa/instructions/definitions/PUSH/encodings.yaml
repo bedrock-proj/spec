@@ -2,6 +2,7 @@ encodings:
   cs:
     pattern: '0001101'
     syntax: PUSH CS
+    fixed_operand_roles: [reg]
   rn_r:
     pattern: 011rrrr
     syntax: PUSH Rn(r)

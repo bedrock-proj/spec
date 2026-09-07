@@ -2,26 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import json
 import os
-from pathlib import Path, PurePosixPath
 import subprocess
 import tempfile
+from dataclasses import asdict
+from importlib import import_module
+from pathlib import Path, PurePosixPath
 
-from engine.composition import DocumentComposition
-from engine.generation import (
-    ArtifactGenerationContext,
-    ArtifactGenerator,
-    ArtifactGeneratorRegistry,
-    GeneratedArtifact,
-    GeneratedArtifactSet,
-)
-from engine.site.build import SiteDocument, SiteOutputError, render_site_output
-from engine.site.model import DocumentSiteSpec, build_site, scoped_target
-from engine.site.structure import parse_latex_structure
-from engine.site.visual import extract_visuals
+from engine.artifacts.definition import GeneratedArtifact, GeneratedArtifactSet
+from engine.artifacts.generate import ArtifactGenerationContext
 
+site_build = import_module("artifacts.web-reference.site.build")
+site_projection = import_module("artifacts.web-reference.site.projection")
 
 _DOCUMENTS = (
     (
@@ -46,158 +39,118 @@ _DOCUMENTS = (
 )
 
 
-class Generator(ArtifactGenerator):
-    """Stage current TeX projections, PDFs, Pandoc pages, visuals, and MkDocs."""
-
-    def generate(self, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
-        project = context.require_provider("isa")
-        registry = ArtifactGeneratorRegistry.discover(context.workspace)
-        composition = DocumentComposition.load(
-            registry.generator("isa-reference").definition.source, project
-        )
-        environment = dict(os.environ)
-        environment["TEXINPUTS"] = os.pathsep.join(
-            (
-                str(context.workspace.root),
-                str(context.workspace.root / "style"),
-                "",
-            )
-        )
-
-        with tempfile.TemporaryDirectory(prefix="bedrock-reference-site-") as raw:
-            stage = Path(raw)
-            sources = stage / "documents"
-            sources.mkdir()
-            documents = []
-            for artifact_id, site_id, title, pdf_name in _DOCUMENTS:
-                document_generator = registry.generator(artifact_id)
-                output = document_generator.definition.outputs["document"]
-                artifact = registry.generate(
-                    artifact_id, context.workspace, context.output_root
-                ).artifact(output)
-                if not isinstance(artifact.content, str):
-                    raise TypeError(f"{artifact_id}: TeX artifact must be text")
-                source = sources / Path(output).name
-                source.write_text(artifact.content, encoding="utf-8")
-                derived = document_generator.definition.derived_outputs
-                pdf = context.output_root / derived["compiled-document"]
-                validation = context.output_root / derived["pdf-validation"]
-                if not pdf.is_file() or not validation.is_file():
-                    raise SiteOutputError(
-                        f"{artifact_id}: build and validate the document before "
-                        "generating the reference site"
-                    )
-                try:
-                    metrics = json.loads(validation.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError) as error:
-                    raise SiteOutputError(
-                        f"{artifact_id}: invalid PDF validation report: {validation}"
-                    ) from error
-                if not isinstance(metrics, dict) or not metrics.get("pages"):
-                    raise SiteOutputError(
-                        f"{artifact_id}: PDF validation report has no page result"
-                    )
-                documents.append(
-                    SiteDocument(artifact_id, site_id, title, source, pdf, pdf_name)
+def generate(definition, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
+    site = project_publication(context)
+    registry = context.registry
+    environment = dict(os.environ)
+    environment["TEXINPUTS"] = os.pathsep.join(
+        (str(context.workspace.root), str(context.workspace.root / "style"), "")
+    )
+    with tempfile.TemporaryDirectory(prefix="bedrock-reference-site-") as raw:
+        stage = Path(raw)
+        sources = stage / "documents"
+        sources.mkdir()
+        documents = []
+        for artifact_id, site_id, title, pdf_name in _DOCUMENTS:
+            document_generator = registry.definition(artifact_id)
+            output = document_generator.outputs["document"]
+            artifact = context.generate(artifact_id, None).artifact(output)
+            if not isinstance(artifact.content, str):
+                raise TypeError(f"{artifact_id}: TeX artifact must be text")
+            source = sources / Path(output).name
+            source.write_text(artifact.content, encoding="utf-8")
+            derived = document_generator.derived_outputs
+            pdf = context.output_root / derived["compiled-document"]
+            validation = context.output_root / derived["pdf-validation"]
+            if not pdf.is_file() or not validation.is_file():
+                raise site_build.SiteOutputError(
+                    f"{artifact_id}: build and validate the document before generating the reference site"
                 )
-
-            site_root = stage / "site"
-            metrics = render_site_output(
-                documents,
-                composition,
-                site_root,
-                source_revision=self._revision(context.workspace.root),
-                pandoc=os.environ.get("PANDOC", "pandoc"),
-                latexpand=os.environ.get("LATEXPAND", "latexpand"),
-                mkdocs=os.environ.get("MKDOCS", "mkdocs"),
-                latexmk=os.environ.get("LATEXMK", "latexmk"),
-                environment=environment,
+            try:
+                metrics = json.loads(validation.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise site_build.SiteOutputError(
+                    f"{artifact_id}: invalid PDF validation report: {validation}"
+                ) from error
+            if not isinstance(metrics, dict) or not metrics.get("pages"):
+                raise site_build.SiteOutputError(
+                    f"{artifact_id}: PDF validation report has no page result"
+                )
+            documents.append(
+                site_build.SiteDocument(
+                    artifact_id, site_id, title, source, pdf, pdf_name
+                )
             )
-            reference = {
-                "documents": [item[2] for item in _DOCUMENTS],
-                "metrics": asdict(metrics),
-            }
-            assets = site_root / "assets"
-            assets.mkdir(exist_ok=True)
-            (assets / "reference.json").write_text(
-                json.dumps(reference, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-            )
-            artifacts = tuple(
-                GeneratedArtifact(Path("site") / path.relative_to(site_root), path.read_bytes())
+        site_root = stage / "site"
+        metrics = site_build.build_site(
+            site,
+            documents,
+            site_root,
+            repository=context.workspace.root,
+            source_revision=revision(context.workspace.root),
+            pandoc=os.environ.get("PANDOC", "pandoc"),
+            mkdocs=os.environ.get("MKDOCS", "mkdocs"),
+            latexmk=os.environ.get("LATEXMK", "latexmk"),
+            environment=environment,
+        )
+        reference = {
+            "documents": [item[2] for item in _DOCUMENTS],
+            "metrics": asdict(metrics),
+        }
+        assets = site_root / "assets"
+        assets.mkdir(exist_ok=True)
+        (assets / "reference.json").write_text(
+            json.dumps(reference, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        artifacts = tuple(
+            (
+                GeneratedArtifact(
+                    definition.outputs["publication"] / path.relative_to(site_root), path.read_bytes()
+                )
                 for path in sorted(site_root.rglob("*"))
                 if path.is_file()
             )
-        return GeneratedArtifactSet(artifacts, artifact_id=self.artifact_id)
+        )
+    return GeneratedArtifactSet(artifacts, artifact_id=definition.id)
 
-    def validate(self, context: ArtifactGenerationContext) -> None:
-        """Validate the public site projection without compiling or publishing it."""
 
-        project = context.require_provider("isa")
-        registry = ArtifactGeneratorRegistry.discover(context.workspace)
-        composition = DocumentComposition.load(
-            registry.generator("isa-reference").definition.source, project
+def validate(definition, context: ArtifactGenerationContext) -> None:
+    """Validate the public site projection without compiling or publishing it."""
+    project_publication(context)
+    if set(definition.outputs) != {"publication"}:
+        raise ValueError(f"{definition.source}: web output must select one publication root")
+
+
+def revision(repository: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+
+def project_publication(context):
+    key = (project_publication, id(context.workspace))
+
+    def project_selected():
+        registry = context.registry
+        manual = registry.entrypoint("isa-reference", "project")(
+            registry.definition("isa-reference"), context
         )
         documents = []
-        preserved_targets: set[str] = set()
         for artifact_id, site_id, title, pdf_name in _DOCUMENTS:
-            generator = registry.generator(artifact_id)
-            document_output = generator.definition.outputs["document"]
-            artifact = registry.generate(
-                artifact_id, context.workspace, context.output_root
-            ).artifact(document_output)
-            if not isinstance(artifact.content, str):
+            definition = registry.definition(artifact_id)
+            source = registry.entrypoint(artifact_id, "render_source")(definition, context)
+            if not isinstance(source, str):
                 raise TypeError(f"{artifact_id}: TeX artifact must be text")
-
-            structure = parse_latex_structure(artifact.content)
-            visualized = extract_visuals(site_id, artifact.content, structure)
-            transformed = parse_latex_structure(visualized.text)
-            original_labels = {label.name for label in structure.labels}
-            transformed_labels = {label.name for label in transformed.labels}
-            missing = sorted(original_labels - transformed_labels)
-            if missing:
-                raise SiteOutputError(
-                    f"{site_id}: visual projection changed public labels; "
-                    f"missing={missing}"
-                )
-            preserved_targets.update(
-                scoped_target(site_id, label) for label in transformed_labels
-            )
             documents.append(
-                DocumentSiteSpec(
-                    site_id,
-                    title,
-                    PurePosixPath("downloads") / pdf_name,
-                    structure,
-                )
+                (site_id, title, PurePosixPath("downloads") / pdf_name, source)
             )
-
-        site = build_site(tuple(documents), composition)
-        expected_anchors = {
-            name
-            for name, target in site.registry.targets.items()
-            if target.anchor is not None
-        }
-        missing = sorted(expected_anchors - preserved_targets)
-        if missing:
-            raise SiteOutputError(
-                f"source anchor ownership mismatch; missing={missing}"
-            )
-
-        publication = self.definition.outputs["publication"]
-        self.definition.validate_generated(
-            GeneratedArtifactSet(
-                (GeneratedArtifact(publication / "index.html", b""),),
-                artifact_id=self.artifact_id,
-            )
+        return site_projection.project_site(
+            documents, manual.instruction_groups
         )
 
-    @staticmethod
-    def _revision(repository: Path) -> str:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repository,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        return result.stdout.strip() if result.returncode == 0 else "unknown"
+    return context.shared_result(key, project_selected)

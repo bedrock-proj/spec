@@ -43,6 +43,11 @@ function cfi_stack_record_request(kind : Primitive_request_kind,
       width = width,
       buffer_offset = 0,
     }|],
+    validation_ranges = [|struct {
+      effective_address = address,
+      linear_address = point.linear,
+      width = width,
+    }|],
     body_length = if kind == Read then width else 0,
     payload_bytes = if kind == Write then payload else [||],
   }

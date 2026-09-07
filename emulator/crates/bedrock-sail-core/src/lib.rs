@@ -86,6 +86,10 @@ pub struct SailCoreFault {
     pub operation: i32,
     pub error_code: u64,
     pub bus_error: u8,
+    pub address_valid: u8,
+    pub effective_address: u64,
+    pub linear_address: u64,
+    pub width: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -205,6 +209,7 @@ pub struct SailCoreRequest {
     pub read_completion: i32,
     pub memory_cache_hint: i32,
     pub memory_ranges: Vec<SailCoreMemoryRange>,
+    pub validation_ranges: Vec<SailCoreValidationRange>,
     pub commit_point: bool,
     pub memory_order: i64,
     pub cache_policy: i64,
@@ -222,6 +227,14 @@ pub struct SailCoreMemoryRange {
     pub linear_address: u64,
     pub width: i64,
     pub buffer_offset: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct SailCoreValidationRange {
+    pub effective_address: u64,
+    pub linear_address: u64,
+    pub width: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -275,6 +288,7 @@ pub struct SailCoreResponse {
     pub success: bool,
     pub fault_kind: i32,
     pub fault_cause: i64,
+    pub fault_range: Option<SailCoreValidationRange>,
     pub detail: String,
     pub value: u64,
     pub secondary_value: u64,
@@ -296,6 +310,14 @@ pub struct SailCoreEnvironmentState {
     pub cycle_counter: u64,
     pub retired_instruction_counter: u64,
     pub page_walk_counter: u64,
+}
+
+impl SailCoreEnvironmentState {
+    fn page_walk_started(&mut self, enabled: bool) {
+        if enabled {
+            self.page_walk_counter = self.page_walk_counter.wrapping_add(1);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -328,6 +350,7 @@ struct RawSailCoreRequest {
     read_completion: i32,
     memory_cache_hint: i32,
     memory_range_count: usize,
+    validation_range_count: usize,
     commit_point: u8,
     memory_order: i64,
     cache_policy: i64,
@@ -345,6 +368,8 @@ struct RawSailCoreResponse {
     success: u8,
     fault_kind: i32,
     fault_cause: i64,
+    fault_range_present: u8,
+    fault_range: SailCoreValidationRange,
     detail: *const c_char,
     value: u64,
     secondary_value: u64,
@@ -367,6 +392,7 @@ impl RawSailCoreRequest {
         self,
         payload: Vec<u8>,
         memory_ranges: Vec<SailCoreMemoryRange>,
+        validation_ranges: Vec<SailCoreValidationRange>,
     ) -> SailCoreRequest {
         SailCoreRequest {
             kind: self.kind,
@@ -396,6 +422,7 @@ impl RawSailCoreRequest {
             read_completion: self.read_completion,
             memory_cache_hint: self.memory_cache_hint,
             memory_ranges,
+            validation_ranges,
             commit_point: self.commit_point != 0,
             memory_order: self.memory_order,
             cache_policy: self.cache_policy,
@@ -415,6 +442,8 @@ impl RawSailCoreResponse {
             success: response.success.into(),
             fault_kind: response.fault_kind,
             fault_cause: response.fault_cause,
+            fault_range_present: response.fault_range.is_some().into(),
+            fault_range: response.fault_range.unwrap_or_default(),
             detail,
             value: response.value,
             secondary_value: response.secondary_value,
@@ -656,11 +685,29 @@ impl SailCore {
                 &mut range_count,
             )
         });
-        if range_status == SailCoreStatus::NeedsEnvironment {
-            Ok(request.into_request(payload, memory_ranges))
-        } else {
-            Err(range_status)
+        if range_status != SailCoreStatus::NeedsEnvironment {
+            return Err(range_status);
         }
+        let mut validation_count = 0;
+        let validation_status = SailCoreStatus::from_raw(unsafe {
+            ffi::bedrock_core_request_validation_ranges(
+                self.raw, std::ptr::null_mut(), 0, &mut validation_count,
+            )
+        });
+        if validation_status != SailCoreStatus::NeedsEnvironment {
+            return Err(validation_status);
+        }
+        let mut validation_ranges = vec![SailCoreValidationRange::default(); validation_count];
+        let validation_status = SailCoreStatus::from_raw(unsafe {
+            ffi::bedrock_core_request_validation_ranges(
+                self.raw, validation_ranges.as_mut_ptr(), validation_ranges.len(),
+                &mut validation_count,
+            )
+        });
+        if validation_status != SailCoreStatus::NeedsEnvironment {
+            return Err(validation_status);
+        }
+        Ok(request.into_request(payload, memory_ranges, validation_ranges))
     }
     pub fn resume(&mut self, response: SailCoreResponse) -> SailCoreStatus {
         let detail = match CString::new(response.detail.as_str()) {
@@ -740,6 +787,12 @@ mod ffi {
         pub fn bedrock_core_request_memory_ranges(
             core: *mut c_void,
             buffer: *mut super::SailCoreMemoryRange,
+            capacity: usize,
+            count: *mut usize,
+        ) -> i32;
+        pub fn bedrock_core_request_validation_ranges(
+            core: *mut c_void,
+            buffer: *mut super::SailCoreValidationRange,
             capacity: usize,
             count: *mut usize,
         ) -> i32;
@@ -1469,6 +1522,56 @@ mod tests {
     }
 
     #[test]
+    fn invalid_response_representation_preserves_pending_execution() {
+        let mut core = SailCore::new().unwrap();
+        assert_eq!(core.set_register(0, 0x100), SailCoreStatus::Ok);
+        assert_eq!(
+            core.execute(&[0xc1, 0x00, 0x00]),
+            SailCoreStatus::NeedsEnvironment
+        );
+        let request = core.last_request().unwrap();
+        let state = core.state().unwrap();
+        let valid = SailCoreResponse {
+            kind: response_kind::READ,
+            success: true,
+            body: vec![0xa5],
+            known: true,
+            present: true,
+            ..SailCoreResponse::default()
+        };
+
+        let mut invalid_responses = Vec::new();
+        let mut invalid = valid.clone();
+        invalid.kind = i32::MAX;
+        invalid_responses.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.fault_kind = i32::MAX;
+        invalid_responses.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.access_class = 2;
+        invalid_responses.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.physical_class = 2;
+        invalid_responses.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.flags = 0x10;
+        invalid_responses.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.generated_fflags = 0x20;
+        invalid_responses.push(invalid);
+
+        for invalid in invalid_responses {
+            assert_eq!(core.resume(invalid), SailCoreStatus::BadArgument);
+            assert_eq!(core.last_request(), Ok(request.clone()));
+            assert_eq!(core.state(), Ok(state.clone()));
+        }
+
+        assert_eq!(core.resume(valid), SailCoreStatus::Ok);
+        assert_eq!(core.register(0), Ok(0xa5));
+        assert_eq!(core.pc(), Ok(3));
+    }
+
+    #[test]
     fn ea_postincrement_is_an_explicit_speculative_uop() {
         let mut core = SailCore::new().unwrap();
         assert_eq!(core.set_register(2, 0x100), SailCoreStatus::Ok);
@@ -1653,6 +1756,7 @@ mod tests {
                 success: false,
                 fault_kind: crate::translation::FAULT_ACCESS,
                 fault_cause: 7,
+                fault_range: request.validation_ranges.first().copied(),
                 detail: "store failed before the point of no return".to_owned(),
                 ..SailCoreResponse::default()
             }),
@@ -1681,6 +1785,7 @@ mod tests {
                 fault_kind: crate::translation::FAULT_ACCESS,
                 fault_cause: 7,
                 detail: "store failed after the point of no return".to_owned(),
+                fault_range: irrevocable.last_request().unwrap().validation_ranges.first().copied(),
                 atomic_store_happened: true,
                 ..SailCoreResponse::default()
             }),

@@ -1,11 +1,11 @@
+
 import unittest
 from pathlib import Path
 
 import yaml
 from jsonschema import Draft202012Validator
 
-from engine.project import IsaProject
-from engine.type_system import TypeSystem
+from engine.isa.project import load_isa
 
 
 class InstructionEncodingsSchemaTest(unittest.TestCase):
@@ -20,8 +20,8 @@ class InstructionEncodingsSchemaTest(unittest.TestCase):
         )
         Draft202012Validator.check_schema(cls.schema)
         cls.validator = Draft202012Validator(cls.schema)
-        cls.types = TypeSystem.load(isa_root)
-        cls.project = IsaProject.load(isa_root)
+        cls.project = load_isa(isa_root)
+        cls.types = cls.project.types
 
     @staticmethod
     def document() -> dict:
@@ -96,7 +96,7 @@ class InstructionEncodingsSchemaTest(unittest.TestCase):
                 )
 
     def test_loaded_forms_obey_their_typed_encoding_contract(self) -> None:
-        for bundle in self.project.select():
+        for bundle in self.project.catalog.select():
             for form in bundle.encodings.forms:
                 with self.subTest(reference=bundle.reference, encoding=form.id):
                     self.assertEqual(form.syntax.mnemonic, bundle.instruction.mnemonic)

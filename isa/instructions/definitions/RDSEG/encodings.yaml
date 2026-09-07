@@ -12,6 +12,7 @@ encodings:
   cs_rn_d:
     pattern: 11101101010000dddd
     syntax: RDSEG CS, Rn(d)
+    fixed_operand_roles: [seg]
     fields:
       d:
         role: dst

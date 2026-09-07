@@ -1,14 +1,9 @@
 generator: generator.py
-inputs:
-- isa
-- abi.elf
-- abi.c
-- interfaces.c
 depends-on:
 - isa-reference
 - elf-abi
 - c-abi
 - c-target-intrinsics
-summary: Browsable ISA reference site generated from the project model and authored topics.
+summary: Browsable reference site assembled from document artifacts.
 outputs:
   publication: site

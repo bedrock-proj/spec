@@ -89,14 +89,7 @@ function uop_operand_location(operand : Decoded_operand) -> Uop_location =
                 uop_location_make_sp()
             } else {
                 if operand.operand_type == OperandType_EA then {
-                    match operand.ea {
-                        Some(ea) => if ea.kind == EaKind_immediate then {
-                            uop_location_make_immediate(ea.payload)
-                        } else {
-                            uop_location_make_immediate(ea_signed_payload(ea))
-                        },
-                        None() => uop_location_make_none(),
-                    }
+                    uop_location_make_none()
                 } else {
                     uop_location_make_immediate(immediate_value(operand))
                 }
@@ -104,57 +97,32 @@ function uop_operand_location(operand : Decoded_operand) -> Uop_location =
         }
     }
 
-function uop_ea_update_location(ea : Decoded_ea) -> option(Uop_location) =
-    if ea.update_target == Some(EaUpdateTarget_b) & ea.base == Some(EaBase_SP) then {
-        Some(uop_location_make_sp())
-    } else {
-        if ea.update_target == Some(EaUpdateTarget_b) then {
-            match ea_field_role(EaRole_base, ea.fields) {
-                Some(index) => Some(uop_location_make_register(index)),
-                None() => None(),
-            }
-        } else {
-            if ea.update_target == Some(EaUpdateTarget_i) then {
-                match ea_field_role(EaRole_index, ea.fields) {
-                    Some(index) => Some(uop_location_make_register(index)),
-                    None() => None(),
-                }
-            } else {
-                None()
-            }
-        }
+function uop_ea_update_location(ea : Decoded_ea, target : Ea_update_target) -> option(Uop_location) =
+    match ea_field_role(if target == EaUpdateTarget_base then EaRole_base else EaRole_index, ea.fields) {
+        Some(index) => Some(uop_location_make_register(index)),
+        None() => None(),
     }
 
-function uop_ea_update_program(operand : Decoded_operand, width : int, pre : bool) -> list(Uop) =
+function uop_ea_role_update_program(operand : Decoded_operand, ea : Decoded_ea,
+                                    width : int, target : Ea_update_target) -> list(Uop) =
+    match (ea_autoupdate_for(target, ea.autoupdates), uop_ea_update_location(ea, target)) {
+        (Some(update), Some(destination)) => [|
+            uop_make(
+                UopIntegerAdd(), destination,
+                uop_location_make_ea_update_amount(Some(update.difference), width,
+                    update.mode == EaUpdateMode_predecrement),
+                destination, operand.name, 8, CommitRegisters,
+            ),
+        |],
+        _ => [||],
+    }
+
+function uop_ea_update_program(operand : Decoded_operand, width : int) -> list(Uop) =
     match operand.ea {
         None() => [||],
-        Some(ea) => {
-            let selected = if pre then {
-                    ea.update_mode == Some(EaUpdateMode_predecrement)
-                } else {
-                    ea.update_mode == Some(EaUpdateMode_postincrement)
-                };
-            if not_bool(selected) then {
-                [||]
-            } else {
-                match uop_ea_update_location(ea) {
-                    None() => [||],
-                    Some(destination) => {
-                        [|
-                            uop_make(
-                                UopIntegerAdd(),
-                                destination,
-                                uop_location_make_ea_update_amount(ea.update_difference, width, pre),
-                                destination,
-                                operand.name,
-                                8,
-                                CommitRegisters,
-                            ),
-                        |]
-                    },
-                }
-            }
-        },
+        Some(ea) => uop_program_append(
+            uop_ea_role_update_program(operand, ea, width, EaUpdateTarget_base),
+            uop_ea_role_update_program(operand, ea, width, EaUpdateTarget_index)),
     }
 
 function uop_operand_lower(
@@ -182,8 +150,8 @@ function uop_operand_lower(
             struct {
                 program =
                     uop_program_append(
-                        uop_ea_update_program(operand, width, true),
-                        uop_program_append(calculate, uop_program_append(uop_ea_update_program(operand, width, false), load)),
+                        calculate,
+                        uop_program_append(uop_ea_update_program(operand, width), load),
                     ),
                 value = value,
                 address = address,
@@ -191,11 +159,14 @@ function uop_operand_lower(
                 memory = true,
             }
         } else {
+            let value = uop_location_make_temporary(next_temporary);
             struct {
-                program = [||],
-                value = uop_operand_location(operand),
+                program = uop_program_append(
+                    [|uop_make(UopCalcEa(), uop_location_make_none(), uop_location_make_none(), value, operand.name, width, CommitNone)|],
+                    uop_ea_update_program(operand, width)),
+                value = value,
                 address = uop_location_make_none(),
-                next_temporary = next_temporary,
+                next_temporary = next_temporary + 1,
                 memory = false,
             }
         },

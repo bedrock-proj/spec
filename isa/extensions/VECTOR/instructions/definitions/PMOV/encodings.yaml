@@ -9,6 +9,11 @@ encodings:
       e:
         role: src
         type: base.field_types.EA
+    constraints:
+    - role: src
+      exclude:
+      - immediate
+      reason: invalid_source
   pn_p_ea_e:
     pattern: 1111111100000011000000000000001ppppeeeeeee
     syntax: PMOV Pn(p), <ea>(e)

@@ -1,3 +1,6 @@
+
+from engine.isa.types import load_type_system
+from engine.isa.extensions import load_extension_inventory
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,7 +8,7 @@ from pathlib import Path
 import yaml
 
 from engine.reference import Reference, UnknownReferenceError
-from engine.type_system import TypeSystem
+from engine.isa.types import TypeSystem
 
 
 class TypeSystemTest(unittest.TestCase):
@@ -63,14 +66,14 @@ class TypeSystemTest(unittest.TestCase):
         path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
 
     def test_loads_declared_owner_namespaces(self) -> None:
-        types = TypeSystem.load(self.root)
+        types = load_type_system(self.root, extensions=load_extension_inventory(self.root))
 
         self.assertEqual(set(types.extensions), {"SAMPLE"})
         self.assertEqual(types.namespace("base").owner, "base")
         self.assertEqual(types.namespace("SAMPLE").owner, "SAMPLE")
 
     def test_projects_typed_definitions_into_global_indexes(self) -> None:
-        types = TypeSystem.load(self.root)
+        types = load_type_system(self.root, extensions=load_extension_inventory(self.root))
         namespaces = (types.base, *types.extensions.values())
 
         for namespace in namespaces:
@@ -80,14 +83,14 @@ class TypeSystemTest(unittest.TestCase):
                 self.assertIs(types.payload_types[reference], definition)
 
     def test_reference_resolution_does_not_fall_back_across_owners(self) -> None:
-        types = TypeSystem.load(self.root)
+        types = load_type_system(self.root, extensions=load_extension_inventory(self.root))
 
         with self.assertRaises(UnknownReferenceError):
             types.payload_types.resolve(
                 Reference.parse("SAMPLE.payload_types.BASE_ONLY")
             )
 
-    def test_ignores_an_undeclared_extension_namespace(self) -> None:
+    def test_undeclared_extension_namespace_is_rejected_before_loading_types(self) -> None:
         self._write(
             "extensions/UNLISTED/field_types.yaml",
             {
@@ -102,11 +105,9 @@ class TypeSystemTest(unittest.TestCase):
         )
         self._write("extensions/UNLISTED/payload_types.yaml", {"payload_types": {}})
 
-        types = TypeSystem.load(self.root)
+        with self.assertRaises(ValueError):
+            load_type_system(self.root, extensions=load_extension_inventory(self.root))
 
-        self.assertEqual(set(types.extensions), {"SAMPLE"})
-        with self.assertRaises(UnknownReferenceError):
-            types.field_types.resolve(Reference.parse("UNLISTED.field_types.Hidden"))
 
 
 if __name__ == "__main__":

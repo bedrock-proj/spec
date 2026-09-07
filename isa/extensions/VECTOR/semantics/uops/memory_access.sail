@@ -26,6 +26,9 @@ function vector_memory_request(
         } else {
             active_bytes
         };
+    let ranges = vector_memory_ranges(
+            predicate_move, predicate, evaluation.effective_address,
+            evaluation.linear_address, length, element_bytes);
     struct {
         kind = kind,
         ordinal = 0,
@@ -48,9 +51,8 @@ function vector_memory_request(
         debug_validation = false,
         debug_validated = false,
         physical_address = 0x0000000000000000,
-        memory_ranges = vector_memory_ranges(
-            predicate_move, predicate, evaluation.effective_address,
-            evaluation.linear_address, length, element_bytes),
+        memory_ranges = ranges,
+        validation_ranges = memory_validation_ranges(ranges),
         read_completion = ReadCompletionData,
         memory_cache_hint = MemoryCacheDefault,
         commit_point = true,
@@ -114,6 +116,9 @@ function vector_uop_memory_request_make(
         } else {
             active_bytes
         };
+    let ranges = vector_memory_ranges(
+            predicate_move, vector_memory_predicate(instruction, state),
+            address.effective_address, address.linear_address, length, element_bytes);
     struct {
         kind = kind,
         ordinal = 0,
@@ -136,9 +141,8 @@ function vector_uop_memory_request_make(
         debug_validation = false,
         debug_validated = false,
         physical_address = 0x0000000000000000,
-        memory_ranges = vector_memory_ranges(
-            predicate_move, vector_memory_predicate(instruction, state),
-            address.effective_address, address.linear_address, length, element_bytes),
+        memory_ranges = ranges,
+        validation_ranges = memory_validation_ranges(ranges),
         read_completion = ReadCompletionData,
         memory_cache_hint = MemoryCacheDefault,
         commit_point = true,

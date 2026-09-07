@@ -9,7 +9,7 @@ properties:
   call_kind: {type: string, pattern: '^[a-z][a-z0-9_]*$'}
   size_bits:
     oneOf:
-    - {type: integer, minimum: 1}
+    - {type: integer, minimum: 8, multipleOf: 8}
     - {type: string, minLength: 1}
   alignment_bytes: {type: integer, minimum: 1}
   representation: {type: string, pattern: '^[a-z][a-z0-9_]*$'}

@@ -1,6 +1,6 @@
 import unittest
 
-from engine.instruction_metasyntax import (
+from engine.syntax.instruction import (
     AddressExpression,
     BracedOperandGroup,
     DecimalLiteral,
@@ -29,7 +29,10 @@ class InstructionMetasyntaxTest(unittest.TestCase):
         self.assertEqual(selected.size_field, "z")
         self.assertEqual(selected.order_field, "o")
         self.assertEqual(
-            [(operand.name, operand.angled, operand.field) for operand in selected.operands],
+            [
+                (operand.name, operand.angled, operand.field)
+                for operand in selected.operands
+            ],
             [("Rn", False, "s"), ("ea", True, "e")],
         )
 

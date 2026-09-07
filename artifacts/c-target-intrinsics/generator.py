@@ -1,125 +1,71 @@
+"""Render selected C interface documentation rows."""
 from __future__ import annotations
 
-import re
-from typing import TypeAlias
-
-from engine.generation import (
-    AuthoredTexArtifactGenerator,
-    ArtifactGenerationContext,
-    GeneratedArtifact,
-    GeneratedArtifactSet,
-)
-from engine.workspace import SpecWorkspace
-from interfaces.c.model import CInterfaceProject
-from engine.reference import QualifiedReference
-from interfaces.c.model import InterfaceType
-from interfaces.c.model.naming import intrinsic_group_header
+from engine.documents.abi import IntrinsicGroupsProjection, IntrinsicGroupProjection, IntrinsicTypesProjection
+from interfaces.c.model.project import InterfaceType
+from interfaces.c.model.projection import project_c_interface
+from artifacts._shared.documents import authored_tex_generate, authored_document_source, build_document
+from artifacts._shared.c_target_names import intrinsic_group_header
 
 
-class Generator(AuthoredTexArtifactGenerator):
-    """Publish target-intrinsic prose from its validated workspace model."""
-
-    def generate(self, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
-        project = context.require_provider("interfaces.c")
-        if not isinstance(project, CInterfaceProject):
-            raise TypeError("interfaces.c provider must be a CInterfaceProject")
-        source = context.workspace.root / str(self.definition.data["source"])
-        output = self.definition.outputs["document"]
-        content = source.read_text(encoding="utf-8")
-        content = content.replace(
-            r"\BedrockGeneratedHeaderFamilies{}", _render_header_families(project)
-        )
-        content = content.replace(
-            r"\BedrockGeneratedInterfaceTypes{}", _render_types(project)
-        )
-
-        def replace_group(match: re.Match[str]) -> str:
-            return _render_intrinsic_group(
-                project, context.workspace, match.group(1)
-            )
-
-        content = re.sub(
-            r"\\BedrockGeneratedIntrinsicGroup\{([a-z0-9_]+)\}",
-            replace_group,
-            content,
-        )
-        self.expander.expand(content, context.workspace.root)
-        return GeneratedArtifactSet(
-            (GeneratedArtifact(output, content),), artifact_id=self.artifact_id
-        )
+def _inputs(context):
+    interface = context.workspace.require_provider("interfaces.c")
+    isa = context.workspace.require_provider("isa")
+    c_abi = context.workspace.require_provider("abi.c")
+    project = context.shared_result((project_c_interface, id(interface), id(isa), id(c_abi)), lambda: project_c_interface(interface, isa, c_abi))
+    return {"isa": isa, "interfaces.c": project}
 
 
-def _render_header_families(project: CInterfaceProject) -> str:
-    membership = {
-        group: collection.id
-        for collection in project.collections.values()
-        for group in collection.groups
-    }
+def render_source(definition, context):
+    return authored_document_source(definition, context, _inputs(context), render_fragment=render_fragment)
+
+
+def validate(definition, context):
+    render_source(definition, context)
+
+
+def generate(definition, context):
+    return authored_tex_generate(definition, render_source(definition, context))
+
+
+def build(definition, context, *, compile_pdf, latexmk="latexmk"):
+    return build_document(definition, context, compile_pdf=compile_pdf, latexmk=latexmk)
+
+
+def render_fragment(projection, labels):
+    if isinstance(projection, IntrinsicGroupsProjection): return _render_header_families(projection)
+    if isinstance(projection, IntrinsicGroupProjection): return _render_intrinsic_group(projection)
+    if isinstance(projection, IntrinsicTypesProjection): return _render_types(projection)
+    raise TypeError(f"unsupported C interface fragment {type(projection).__name__}")
+
+
+def _render_header_families(projection) -> str:
     rows = []
-    for group in sorted(project.intrinsic_groups.values(), key=lambda item: item.id):
+    for group, collections, exposure in projection.rows:
         family = group.title.removesuffix(" Intrinsics")
-        rows.append(
-            f"{family} & \\texttt{{\\textless{{}}"
-            f"{intrinsic_group_header(group.id)}\\textgreater{{}}}} & "
-            f"{membership[group.id]} & {group.data['exposure']}\\\\"
-        )
-    return _longtable(
-        "Target Intrinsic Header Families",
-        ("Family", "Header", "Umbrella", "Exposure"),
-        rows,
-        "p{1.15in}p{1.65in}p{0.65in}p{2.15in}",
-    )
+        umbrella = ", ".join(collection.id for collection in collections)
+        rows.append(f"{family} & " + _code("<" + intrinsic_group_header(group.id) + ">") + f" & {umbrella} & {exposure}" + r"\\")
+    return _longtable("Target Intrinsic Header Families", ("Family", "Header", "Umbrella", "Exposure"), rows, "p{1.15in}p{1.65in}p{0.65in}p{2.15in}")
 
 
-def _render_intrinsic_group(
-    project: CInterfaceProject, workspace: SpecWorkspace, group_id: str
-) -> str:
-    group = next(
-        item for item in project.intrinsic_groups.values() if item.id == group_id
-    )
+def _render_intrinsic_group(projection) -> str:
     rows = []
-    for intrinsic in sorted(project.intrinsics.values(), key=lambda item: item.id):
-        if intrinsic.group != group_id:
-            continue
-        result = _document_type(intrinsic.result_type, project)
-        parameters = ",".join(
-            _document_type(parameter_type, project)
-            for parameter_type in intrinsic.parameter_types
-        ) or "void"
-        operation = workspace.resolve(intrinsic.operation).instruction.mnemonic
-        operands = intrinsic.data["lowering"].get("operands", {})
+    for intrinsic, signature, bundle, operands, description in projection.rows:
+        result, parameters = signature
+        parameter_types = ",".join(_document_type(kind) for _, kind, _ in parameters) or "void"
+        operation = bundle.instruction.mnemonic
         if "size" in operands:
             operation += f".{operands['size']}"
         elif "source" in operands:
             operation += f" {operands['source']}"
-        rows.append(
-            f"\\texttt{{{_tex(intrinsic.id)}}} & "
-            f"\\texttt{{{_tex(result)}({_tex(parameters)})}} & "
-            f"\\texttt{{{_tex(operation)}}} & "
-            f"{intrinsic.data['description']}\\\\"
-        )
-    return _longtable(
-        group.title,
-        ("Name", "C interface", "Lowering", "Availability, constraint, and effect"),
-        rows,
-        "p{1.4in}p{1.4in}p{0.8in}p{2.0in}",
-    )
+        signature_text = _document_type(result) + "(" + parameter_types + ")"
+        rows.append(" & ".join((_code(intrinsic.id), _code(signature_text), _code(operation), description)) + r"\\")
+    return _longtable(projection.group.title, ("Name", "C interface", "Lowering", "Availability, constraint, and effect"), rows, "p{1.4in}p{1.4in}p{0.8in}p{2.0in}")
 
 
-def _render_types(project: CInterfaceProject) -> str:
-    rows = []
-    for interface_type in sorted(project.types.values(), key=lambda item: item.id):
-        spelling = f"__bedrock_{interface_type.id}_t"
-        rows.append(
-            f"\\texttt{{{_tex(spelling)}}} & "
-            f"{interface_type.data.get('summary', interface_type.kind)}\\\\"
-        )
-    return _longtable(
-        "Target Intrinsic Shared Types",
-        ("Type", "ABI contract"),
-        rows,
-        "p{2.05in}p{3.45in}",
-    )
+def _render_types(projection) -> str:
+    rows = [_code(f"__bedrock_{definition.id}_t") + " & " + description + r"\\" for definition, description in projection.rows]
+    return _longtable("Target Intrinsic Shared Types", ("Type", "ABI contract"), rows, "p{2.05in}p{3.45in}")
 
 
 def _longtable(
@@ -147,30 +93,18 @@ def _longtable(
     )
 
 
-DocumentType: TypeAlias = str | QualifiedReference[InterfaceType]
+
+def _document_type(kind) -> str:
+    if isinstance(kind, InterfaceType):
+        return kind.id
+    names = {"u8": "u8", "u16": "u16", "u32": "u32", "u64": "u64", "f32": "float", "f64": "double", "size": "size_t", "void": "void", "void_pointer": "void *", "const_void_pointer": "const void *"}
+    if kind in names:
+        return names[kind]
+    if kind.endswith("_pointer") and kind.removesuffix("_pointer") in names:
+        return names[kind.removesuffix("_pointer")] + " *"
+    raise ValueError(f"C interface document cannot represent type {kind!r}")
 
 
-def _document_type(type_id: DocumentType, project: CInterfaceProject) -> str:
-    if isinstance(type_id, QualifiedReference):
-        return project.resolve(type_id.local).id
-    names = {
-        "u8": "u8",
-        "u16": "u16",
-        "u32": "u32",
-        "u64": "u64",
-        "f32": "float",
-        "f64": "double",
-        "size": "size_t",
-        "void": "void",
-        "void_pointer": "void *",
-        "const_void_pointer": "const void *",
-    }
-    if type_id in names:
-        return names[type_id]
-    if type_id.endswith("_pointer"):
-        return names[type_id.removesuffix("_pointer")] + " *"
-    return type_id
-
-
-def _tex(value: str) -> str:
-    return value.replace("_", r"\_")
+def _code(value: str) -> str:
+    escaped = value.replace("_", r"\_").replace("<", r"\textless{}").replace(">", r"\textgreater{}")
+    return rf"\texttt{{{escaped}}}"

@@ -1,4 +1,6 @@
 sail:
+  instruction_set: FpuTranscendentalSet
+  effect_kinds: [TranscendentalCompute]
   units:
   - id: contract
     requires:

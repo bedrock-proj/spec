@@ -36,6 +36,10 @@ typedef struct bedrock_core_fault {
   int32_t operation;
   uint64_t error_code;
   uint8_t bus_error;
+  uint8_t address_valid;
+  uint64_t effective_address;
+  uint64_t linear_address;
+  int64_t width;
 } bedrock_core_fault;
 
 typedef struct bedrock_core_control_state {
@@ -152,6 +156,7 @@ typedef struct bedrock_core_request {
   int32_t read_completion;
   int32_t memory_cache_hint;
   size_t memory_range_count;
+  size_t validation_range_count;
   uint8_t commit_point;
   int64_t memory_order;
   int64_t cache_policy;
@@ -169,11 +174,19 @@ typedef struct bedrock_core_memory_range {
   int64_t buffer_offset;
 } bedrock_core_memory_range;
 
+typedef struct bedrock_core_validation_range {
+  uint64_t effective_address;
+  uint64_t linear_address;
+  int64_t width;
+} bedrock_core_validation_range;
+
 typedef struct bedrock_core_response {
   int32_t kind;
   uint8_t success;
   int32_t fault_kind;
   int64_t fault_cause;
+  uint8_t fault_range_present;
+  bedrock_core_validation_range fault_range;
   const char *detail;
   uint64_t value;
   uint64_t secondary_value;
@@ -231,6 +244,9 @@ bedrock_core_status bedrock_core_request_payload(
     const bedrock_core *core, uint8_t *buffer, size_t capacity, size_t *length);
 bedrock_core_status bedrock_core_request_memory_ranges(
     const bedrock_core *core, bedrock_core_memory_range *buffer,
+    size_t capacity, size_t *count);
+bedrock_core_status bedrock_core_request_validation_ranges(
+    const bedrock_core *core, bedrock_core_validation_range *buffer,
     size_t capacity, size_t *count);
 bedrock_core_status bedrock_core_cancel(bedrock_core *core);
 bedrock_core_status bedrock_core_resume(

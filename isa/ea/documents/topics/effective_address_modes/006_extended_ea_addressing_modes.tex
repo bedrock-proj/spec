@@ -16,6 +16,8 @@ memory state unchanged apart from the exception-entry transition.
 Postincrement forms use the current temporary value and update it afterward. Predecrement forms update the temporary
 value first and then use the result. A base register changes by the EA interpretation width in bytes; an index
 register changes by one element before scaling. Each REP iteration applies and commits these rules independently.
+Explicit register references observe preceding updates in the temporary evaluation state. These EA evaluation-order
+rules also apply when a field-selected register and an explicit register reference name the same register.
 
 Size-less address-role instructions INVPAGE, FLSHDCACHE, INVDCACHE, INVICACHE, WRBKDCACHE, SYNCCACHE, PREFETCH,
 PREFETCHNT, and PTQUERY have Q interpretation width. Size-less control-target instructions DJcc, IJcc,

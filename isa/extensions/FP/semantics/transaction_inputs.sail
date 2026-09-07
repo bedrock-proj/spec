@@ -56,7 +56,7 @@ function fp_operand_kind_for(
             if fp_destination_is_fn(instruction) then fp_float_kind_for_width(width)
             else fp_float_kind_for_width(fp_conversion_fn_width(instruction.form.operation))
         } else if fp_destination_is_fn(instruction) then {
-            if fp_size_list_is_integer(instruction.form.sizes) then
+            if fp_size_list_is_integer(size_codes(instruction.form.sizes)) then
                 if conversion_unsigned == Some(true) then FpUnsigned64 else FpSigned64
             else fp_float_kind_for_width(width)
         } else FpRaw64
@@ -66,7 +66,7 @@ function fp_operand_kind_for(
         if operand.operand_type == OperandType_Rn then FpRaw64
         else if operand.operand_type == OperandType_FEA then match operand.ea {
             Some(ea) => if ea.kind == EaKind_immediate then {
-                if ea.payload_width == 32 then FpBits32 else FpBits64
+                if ea_payload_width(EaPayloadRole_immediate, ea.payloads) == 32 then FpBits32 else FpBits64
             } else fp_float_kind_for_width(width),
             None() => fp_float_kind_for_width(width),
         }
@@ -91,7 +91,8 @@ function fp_decoded_operand_image(
                 if operand.operand_type == OperandType_FEA then {
                     match operand.ea {
                         Some(ea) => if ea.kind == EaKind_immediate then {
-                            ea.payload
+                            let (evaluation, _) = evaluate_decoded_ea(operand, ea, state, state.pc, width);
+                            evaluation.value
                         } else {
                             operand.value
                         },

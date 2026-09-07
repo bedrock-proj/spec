@@ -1,720 +1,427 @@
-import unittest
+"""Document selection, source provenance, and owned publication contracts."""
+
 import json
-from pathlib import Path
 import re
 import tempfile
+import unittest
+from importlib import import_module
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-import yaml
-
-from engine.composition import (
-    DocumentComposition,
-    InstructionSetBlock,
-    TermGroupBlock,
-    TopicBlock,
-)
-from engine.document import (
-    DocumentBuilder,
-    TexValidationCode,
-    TexValidationIssue,
-    TexValidationReport,
-    TexValidator,
-)
-from engine.generation import (
-    ArtifactDefinition,
-    ArtifactGenerationContext,
-    ArtifactGenerator,
-    ArtifactGeneratorRegistry,
-    ArtifactWriter,
-    GeneratedArtifact,
-    GeneratedArtifactSet,
-)
-from engine.project import IsaProject
-from engine.reference import Reference
-from engine.semantic_text import (
-    EntityReferenceText,
-    LiteralText,
-    TermForm,
-    TermReferenceText,
-)
-from engine.render import (
-    DocumentFragmentContext,
-    DocumentFragmentPipeline,
-    DocumentFragmentProvider,
-    EaDiagramFragmentRenderer,
-    EventReferenceRenderer,
-    LatexSemanticTextRenderer,
-    LatexSourcePreprocessor,
-    MemoryRecordFragmentRenderer,
-    ProjectedInstructionSet,
-    ProjectedTermGroup,
-    ProjectedTopic,
-    RegisterModelFigureRenderer,
-)
+from artifacts._shared.documents import build_document
+from artifacts._shared.latex import TexValidationCode, TexValidationIssue, TexValidationReport, validate_tex
+from engine.artifacts.definition import ArtifactDefinition, GeneratedArtifact, GeneratedArtifactSet
+from engine.artifacts.generate import artifact_context
+from engine.artifacts.registry import ArtifactGeneratorRegistry
+from engine.artifacts.write import write_artifacts
+from engine.documents.composition import load_composition
+from engine.documents.dependencies import DependencyEdge, DependencyGraph
+from engine.documents.fragments.events import project_row_event_reference
+from engine.documents.fragments.memory_records import select_memory_record
+from engine.documents.fragments.registers import select_register_figure
+from engine.documents.projection import project_document
+from engine.documents.sources import SourceInputProjection, SourceReferenceProjection, StyleSourceProjection, project_source
+from engine.documents.targets import PublicTargetCatalog
+from engine.entity import create_entity_catalog
+from engine.isa.events import ArchitecturalEvent, EventCatalog, EventClassDefinition, EventNamespace, EventSelector
+from engine.isa.memory_records import ElementByteSize, MemoryRecord, MemoryRecordCatalog, MemoryRecordComponent, MemoryRecordNamespace
+from engine.isa.model import DocumentTopic
+from engine.isa.registers import ExplicitRegisterGroup, RegisterCatalog, RegisterNamespace
+from engine.isa.terminology import Term, TermAbbreviation, TermCatalog, TermForms, TermGroup, TermRelations, TerminologyNamespace
+from engine.reference import Reference, ReferenceIndex, UnknownReferenceError
+from engine.source.inventory import DirectoryInventory
+from engine.syntax.semantic_text import SemanticText, TermForm, TextOrigin
 from engine.workspace import SpecWorkspace
 
 
-def _reference_text(reference: Reference[object]) -> str:
-    return ".".join((reference.owner, *reference.path, reference.element))
+def _topic(root, name, owner="base"):
+    return DocumentTopic(owner, name, Reference(owner, ("topics",), name), root / "model.yaml", root / f"{name}.tex")
 
 
-class _SampleFragmentProvider(DocumentFragmentProvider):
-    @property
-    def placeholders(self) -> frozenset[str]:
-        return frozenset(("@sample@",))
-
-    def expand(self, text: str, context: DocumentFragmentContext) -> str:
-        return text.replace("@sample@", str(len(context.project.select())))
+def _inventory(root, kind, names=(), owner="base"):
+    return DirectoryInventory(owner, kind, root / f"{kind}.yaml", root, tuple(names), tuple(names))
 
 
-class _DeclaredGenerator(ArtifactGenerator):
-    def generate(self, context: ArtifactGenerationContext) -> GeneratedArtifactSet:
-        raise AssertionError("registry ownership validation must not generate artifacts")
+def _term(root):
+    return Term(
+        Reference("base", ("terms",), "address"), Reference("base", ("term_groups",), "memory"),
+        root / "term.yaml", root, "base", "address", TermForms("effective address"),
+        TermAbbreviation("EA"), None, SemanticText.parse("Address.", origin=TextOrigin(root / "term.yaml")),
+        {}, TermRelations(),
+    )
 
 
-class _FailingCompiler:
-    def compile(
-        self,
-        source: Path,
-        output_root: Path,
-        repository: Path,
-        executable: str,
-    ) -> None:
-        raise RuntimeError("compiler failed for test")
+def _semantic_catalogs(*entities):
+    terms = ReferenceIndex({item.reference: item for item in entities if isinstance(item, Term)})
+    groups = {}
+    namespaces = {}
+    for term in terms.values():
+        if term.group not in groups:
+            members = {item.id: item for item in terms.values() if item.group == term.group}
+            groups[term.group] = TermGroup(term.group, term.source, term.root, term.owner, term.group.element, "Terms", _inventory(term.root, "terms", members, term.owner), members)
+    for group in groups.values():
+        if group.owner not in namespaces:
+            members = {item.id: item for item in groups.values() if item.owner == group.owner}
+            namespaces[group.owner] = TerminologyNamespace(group.owner, group.root, _inventory(group.root, "groups", members, group.owner), members)
+    return {"isa": SimpleNamespace(
+        entities=create_entity_catalog((item, item.reference.element) for item in entities),
+        terminology=TermCatalog(namespaces, ReferenceIndex(groups), terms),
+    )}
 
 
-class _RejectingValidator:
-    def validate(self, tex: str) -> TexValidationReport:
-        return TexValidationReport(
-            passed=False,
-            issues=(
-                TexValidationIssue(TexValidationCode.UNRESOLVED_PLACEHOLDERS),
-            ),
-            quantitative={},
-            qualitative_review={},
-        )
+def _memo(root):
+    return artifact_context(ArtifactGeneratorRegistry({}, {}), SpecWorkspace(root, {}), root / "output").shared_result
 
 
-class DocumentTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.root = (Path(__file__).parents[1] / "isa").resolve()
-        cls.repository = cls.root.parent
-        cls.workspace = SpecWorkspace.load(cls.repository)
-        project = cls.workspace.require_provider("isa")
-        if not isinstance(project, IsaProject):
-            raise TypeError("workspace isa provider must be an IsaProject")
-        cls.project = project
-        cls.composition = DocumentComposition.load(
-            cls.repository / "artifacts/isa-reference/artifact.yaml", cls.project
-        )
-        cls.generator = ArtifactGeneratorRegistry.discover(cls.workspace).generator(
-            "isa-reference"
-        )
-        cls.public_targets = cls.generator.renderer.public_targets(
-            cls.composition, cls.project
-        )
+def _document_fixture(root):
+    definition = ArtifactDefinition("manual", root / "artifact.yaml", {
+        "outputs": {"document": "sources/manual.tex"},
+        "derived-outputs": {
+            "tex-validation": "reports/source.json", "compiled-document": "compiled/manual.pdf",
+            "compile-log": "logs/compiler.log", "pdf-validation": "reports/compiled.json",
+        },
+    })
+    text = r"\begin{document}A document.\end{document}"
 
-    def test_generator_renders_explicit_composition_without_writing(self) -> None:
-        projection = self.generator.renderer.project(
-            self.composition, self.project
-        )
-        self.assertIs(projection.composition, self.composition)
-        self.assertEqual(len(projection.blocks), len(self.composition.blocks))
-        for authored, projected in zip(
-            self.composition.blocks, projection.blocks, strict=True
-        ):
-            with self.subTest(block=authored):
-                if isinstance(authored, TopicBlock):
-                    self.assertIsInstance(projected, ProjectedTopic)
-                    self.assertIs(projected.topic, authored.topic)
-                elif isinstance(authored, TermGroupBlock):
-                    self.assertIsInstance(projected, ProjectedTermGroup)
-                    self.assertIs(projected.block, authored)
-                else:
-                    self.assertIsInstance(authored, InstructionSetBlock)
-                    self.assertIsInstance(projected, ProjectedInstructionSet)
-                    self.assertIs(projected.block, authored)
-                    self.assertEqual(
-                        tuple(topic.topic for topic in projected.introduction),
-                        authored.introduction,
-                    )
-                    self.assertEqual(
-                        tuple(entry.bundle for entry in projected.instructions),
-                        authored.instructions,
-                    )
-                    for entry in projected.instructions:
-                        self.assertEqual(
-                            tuple(item.form for item in entry.formats),
-                            entry.bundle.encodings.forms,
-                        )
-                        for item in entry.formats:
-                            encoded = "".join(
-                                segment.label
-                                if segment.fixed
-                                else segment.label * segment.width
-                                for byte in item.bytes
-                                for segment in byte.segments
-                            )
-                            framing = (
-                                "0"
-                                if item.form.pattern.bit_width == 7
-                                else "10"
-                                if item.form.pattern.bit_width == 14
-                                else "11" + "L" * 4
-                            )
-                            self.assertEqual(
-                                encoded,
-                                framing + item.form.pattern.code,
-                            )
-                            self.assertTrue(
-                                all(
-                                    sum(segment.width for segment in byte.segments)
-                                    == 8
-                                    for byte in item.bytes
-                                )
-                            )
+    def generate(definition, context):
+        return GeneratedArtifactSet((GeneratedArtifact(definition.outputs["document"], text),), definition.id)
 
-        generated = self.generator.generate(
-            ArtifactGenerationContext.create(self.workspace, self.root / "output")
-        )
+    def validate(definition, context):
+        definition.validate_generated(generate(definition, context))
+        if not validate_tex(text).passed:
+            raise ValueError("invalid synthetic document")
 
-        self.generator.definition.validate_generated(generated)
-        self.assertEqual(generated.artifact_id, self.composition.artifact)
-        self.assertEqual(
-            {artifact.relative_path for artifact in generated.artifacts},
-            set(self.generator.definition.outputs.values()),
-        )
+    registry = ArtifactGeneratorRegistry({definition.id: definition}, {definition.id: {"generate": generate, "validate": validate}})
+    context = artifact_context(registry, SpecWorkspace(root, {}), root / "output")
+    return definition, context
 
-    def test_dependency_graph_references_declared_nodes(self) -> None:
-        graph = json.loads(
-            self.generator.generate(
-                ArtifactGenerationContext.create(self.workspace, self.root / "output")
-            )
-            .artifact(self.generator.definition.outputs["dependencies"])
-            .content
-        )
-        node_ids = {node["id"] for node in graph["nodes"]}
-        for edge in graph["edges"]:
-            with self.subTest(edge=edge):
-                self.assertIn(edge["source"], node_ids)
-                self.assertIn(edge["target"], node_ids)
-                self.assertGreater(edge["occurrences"], 0)
 
-    def test_event_code_rows_preserve_resolved_fixed_assignments(self) -> None:
-        for resolved in self.project.events.resolved_events():
-            if resolved.code.value is None:
-                continue
-            with self.subTest(event=resolved.event.reference):
-                row = EventReferenceRenderer.project_row(
-                    self.project.events, resolved.event.reference
-                )
-                self.assertEqual(row.reference, resolved.event.reference)
-                self.assertEqual(row.code, resolved.code.value)
-                self.assertEqual(row.event_id, resolved.event.id)
-
-    def test_source_preprocessor_expands_inputs_and_term_escapes(self) -> None:
+class DocumentSourceTest(unittest.TestCase):
+    def test_input_occurrence_preserves_original_child_and_parent_span(self):
         with tempfile.TemporaryDirectory() as directory:
-            repository = Path(directory)
-            source_root = repository / "isa"
-            source_root.mkdir()
-            root = source_root / "root.tex"
-            child = source_root / "child.tex"
-            root.write_text(
-                r"\textbf{Raw} \input{isa/child.tex}", encoding="utf-8"
-            )
-            child.write_text(
-                "(:term:base.terms.effective_address|short:)", encoding="utf-8"
-            )
+            root = Path(directory).resolve()
+            source, child = root / "root.tex", root / "child.tex"
+            text = r"Before \input{child.tex} after."
+            source.write_text(text)
+            child.write_text("Child source.")
+            projection = project_source(source, None, root, {}, shared_result=_memo(root))
+            occurrence, = projection.parts
+            self.assertIsInstance(occurrence, SourceInputProjection)
+            self.assertEqual(text[occurrence.span.start:occurrence.span.end], r"\input{child.tex}")
+            self.assertEqual(occurrence.span.source, source)
+            self.assertEqual(occurrence.source.source, child)
+            self.assertEqual(occurrence.source.raw, "Child source.")
 
-            class Project:
-                pass
-
-            project = Project()
-            project.root = source_root
-            project.terminology = self.project.terminology
-            project.entities = self.project.entities
-            processor = LatexSourcePreprocessor(
-                DocumentFragmentPipeline(()), LatexSemanticTextRenderer()
-            )
-
-            projection = processor.project(root, project, self.public_targets)
-
-        self.assertEqual(projection.source, root.resolve())
-        self.assertEqual(len(projection.inputs), 1)
-        self.assertEqual(projection.inputs[0].requested, "isa/child.tex")
-        child_projection = projection.inputs[0].source
-        self.assertEqual(child_projection.source, child.resolve())
-        term = next(
-            part
-            for part in child_projection.semantic.parts
-            if isinstance(part, TermReferenceText)
-        )
-        self.assertEqual(
-            term.reference,
-            Reference.parse("base.terms.effective_address"),
-        )
-        self.assertIs(term.form, TermForm.SHORT)
-        self.assertTrue(
-            any(
-                isinstance(part, LiteralText) and r"\textbf{Raw}" in part.value
-                for part in projection.semantic.parts
-            )
-        )
-
-    def test_source_preprocessor_rejects_input_cycles(self) -> None:
+    def test_source_snapshot_is_shared_across_roots_only_within_one_invocation(self):
         with tempfile.TemporaryDirectory() as directory:
-            repository = Path(directory)
-            source_root = repository / "isa"
-            source_root.mkdir()
-            root = source_root / "root.tex"
-            child = source_root / "child.tex"
-            root.write_text(r"\input{isa/child.tex}", encoding="utf-8")
-            child.write_text(r"\input{isa/root.tex}", encoding="utf-8")
+            root = Path(directory).resolve()
+            first, second, child = (root / name for name in ("first.tex", "second.tex", "child.tex"))
+            first.write_text(r"\input{child.tex}")
+            second.write_text(r"\input{child.tex}")
+            child.write_text("First snapshot.")
+            memo = _memo(root)
+            initial = project_source(first, None, root, {}, shared_result=memo)
+            child.write_text("Next snapshot.")
+            same_invocation = project_source(second, None, root, {}, shared_result=memo)
+            next_invocation = project_source(second, None, root, {}, shared_result=_memo(root))
+            self.assertIs(initial.parts[0].source, same_invocation.parts[0].source)
+            self.assertEqual(same_invocation.parts[0].source.raw, "First snapshot.")
+            self.assertEqual(next_invocation.parts[0].source.raw, "Next snapshot.")
 
-            class Project:
-                pass
-
-            project = Project()
-            project.root = source_root
-            project.terminology = self.project.terminology
-            project.entities = self.project.entities
-            processor = LatexSourcePreprocessor(
-                DocumentFragmentPipeline(()), LatexSemanticTextRenderer()
-            )
-            with self.assertRaises(RuntimeError):
-                processor.render(root, project, self.public_targets)
-
-    def test_source_preprocessor_treats_style_files_as_code(self) -> None:
+    def test_term_modifier_preserves_canonical_identity(self):
         with tempfile.TemporaryDirectory() as directory:
-            repository = Path(directory)
-            source_root = repository / "isa"
-            style_root = repository / "style"
-            source_root.mkdir()
-            style_root.mkdir()
-            root = source_root / "root.tex"
-            style = style_root / "sample.sty"
-            root.write_text(r"\input{style/sample.sty}", encoding="utf-8")
-            style.write_text(
-                r"\PackageError{sample}{field widths are invalid}{}",
-                encoding="utf-8",
-            )
+            root = Path(directory).resolve()
+            term = _term(root)
+            source = root / "root.tex"
+            source.write_text("Use (:term:base.terms.address|short:).")
+            projection = project_source(source, None, root, _semantic_catalogs(term), shared_result=_memo(root))
+            occurrence, = projection.parts
+            self.assertIs(occurrence.reference.entity, term)
+            self.assertIs(occurrence.reference.occurrence.form, TermForm.SHORT)
+            self.assertEqual(occurrence.reference.presentation.display, "EA")
 
-            class Project:
-                pass
-
-            project = Project()
-            project.root = source_root
-            project.terminology = self.project.terminology
-            project.entities = self.project.entities
-            processor = LatexSourcePreprocessor(
-                DocumentFragmentPipeline(()), LatexSemanticTextRenderer()
-            )
-
-            projection = processor.project(root, project, self.public_targets)
-
-        self.assertEqual(len(projection.inputs), 1)
-        self.assertEqual(
-            projection.inputs[0].source.style_text,
-            r"\PackageError{sample}{field widths are invalid}{}",
-        )
-
-    def test_source_preprocessor_preserves_authored_literal_prose(self) -> None:
+    def test_active_input_path_cycle_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
-            repository = Path(directory)
-            source_root = repository / "isa"
-            source_root.mkdir()
-            root = source_root / "root.tex"
-            root.write_text(
-                r"an effective address and \texttt{ADD}", encoding="utf-8"
-            )
+            root = Path(directory).resolve()
+            source, child = root / "a.tex", root / "b.tex"
+            source.write_text(r"\input{b.tex}")
+            child.write_text(r"\input{a.tex}")
+            with self.assertRaises(ValueError) as caught:
+                project_source(source, None, root, {}, shared_result=_memo(root))
+            self.assertIn(str(source), str(caught.exception))
+            self.assertIn(str(child), str(caught.exception))
+            self.assertIn("offset 0", str(caught.exception))
+            self.assertIsInstance(caught.exception.__cause__, ValueError)
 
-            class Project:
-                pass
-
-            project = Project()
-            project.root = source_root
-            project.terminology = self.project.terminology
-            project.entities = self.project.entities
-            processor = LatexSourcePreprocessor(
-                DocumentFragmentPipeline(()), LatexSemanticTextRenderer()
-            )
-
-            projection = processor.project(root, project, self.public_targets)
-
-        self.assertEqual(len(projection.semantic.parts), 1)
-        self.assertIsInstance(projection.semantic.parts[0], LiteralText)
-        self.assertEqual(
-            projection.semantic.parts[0].value,
-            r"an effective address and \texttt{ADD}",
-        )
-
-    def test_source_preprocessor_rejects_unknown_term_reference(self) -> None:
+    def test_missing_input_reports_the_parent_occurrence(self):
         with tempfile.TemporaryDirectory() as directory:
-            repository = Path(directory)
-            source_root = repository / "isa"
-            source_root.mkdir()
-            root = source_root / "root.tex"
-            root.write_text(
-                "(:term:base.terms.does_not_exist:)", encoding="utf-8"
-            )
+            root = Path(directory).resolve()
+            source = root / "root.tex"
+            source.write_text(r"Before \input{missing.tex}")
+            with self.assertRaises(ValueError) as caught:
+                project_source(source, None, root, {}, shared_result=_memo(root))
+            self.assertIn(f"{source}, offset 7", str(caught.exception))
+            self.assertIsInstance(caught.exception.__cause__, FileNotFoundError)
 
-            class Project:
-                pass
-
-            project = Project()
-            project.root = source_root
-            project.terminology = self.project.terminology
-            project.entities = self.project.entities
-            processor = LatexSourcePreprocessor(
-                DocumentFragmentPipeline(()), LatexSemanticTextRenderer()
-            )
-            with self.assertRaises(ValueError):
-                processor.render(root, project, self.public_targets)
-
-    def test_source_preprocessor_renders_instruction_reference(self) -> None:
-        instruction = next(
-            bundle
-            for block in self.composition.blocks
-            if isinstance(block, InstructionSetBlock)
-            for bundle in block.instructions
-        )
+    def test_malformed_directive_start_is_rejected_at_its_occurrence(self):
         with tempfile.TemporaryDirectory() as directory:
-            repository = Path(directory)
-            source_root = repository / "isa"
-            source_root.mkdir()
-            root = source_root / "root.tex"
-            root.write_text(
-                f"See (:ref:{_reference_text(instruction.reference)}:).",
-                encoding="utf-8",
-            )
+            root = Path(directory).resolve()
+            source = root / "root.tex"
+            source.write_text("Before (:ref) after.")
+            with self.assertRaisesRegex(
+                ValueError,
+                rf"{re.escape(str(source))}, offset 7: malformed document directive",
+            ):
+                project_source(source, None, root, {}, shared_result=_memo(root))
 
-            class Project:
-                pass
-
-            project = Project()
-            project.root = source_root
-            project.terminology = self.project.terminology
-            project.entities = self.project.entities
-            processor = LatexSourcePreprocessor(
-                DocumentFragmentPipeline(()), LatexSemanticTextRenderer()
-            )
-
-            projection = processor.project(root, project, self.public_targets)
-
-            root.write_text(
-                "(:ref:base.instructions.DOES_NOT_EXIST:)", encoding="utf-8"
-            )
-            with self.assertRaises(ValueError):
-                processor.render(root, project, self.public_targets)
-
-        reference = next(
-            part
-            for part in projection.semantic.parts
-            if isinstance(part, EntityReferenceText)
-        )
-        entity, label = self.public_targets.resolve(reference.reference)
-        self.assertEqual(entity.reference, instruction.reference)
-        self.assertEqual(label, self.public_targets.label(instruction.reference))
-
-    def test_source_preprocessor_rejects_unprojected_register_reference(self) -> None:
-        private_reference = next(
-            reference
-            for reference, _ in self.project.entities.references.items()
-            if not self.public_targets.contains(reference)
-        )
+    def test_style_source_keeps_semantic_like_text_literal(self):
         with tempfile.TemporaryDirectory() as directory:
-            source_root = Path(directory) / "isa"
-            source_root.mkdir()
-            root = source_root / "root.tex"
-            root.write_text(
-                f"Use (:ref:{_reference_text(private_reference)}:).",
-                encoding="utf-8",
-            )
+            root = Path(directory).resolve()
+            source = root / "style.sty"
+            text = r"\newcommand{\example}{(:term:base.terms.unknown:)}"
+            source.write_text(text)
+            projection = project_source(source, None, root, {}, shared_result=_memo(root))
+            self.assertIsInstance(projection, StyleSourceProjection)
+            self.assertEqual(projection.raw, text)
+            self.assertFalse(any(isinstance(part, SourceReferenceProjection) for part in projection.parts))
 
-            class Project:
-                pass
-
-            project = Project()
-            project.root = source_root
-            project.terminology = self.project.terminology
-            project.entities = self.project.entities
-            with self.assertRaises(ValueError):
-                LatexSourcePreprocessor(
-                    DocumentFragmentPipeline(()), LatexSemanticTextRenderer()
-                ).render(root, project, self.public_targets)
-
-    def test_composition_allows_catalog_members_to_remain_private(self) -> None:
-        source = self.repository / "artifacts/isa-reference/artifact.yaml"
-        original = yaml.safe_load(source.read_text(encoding="utf-8"))
-        original["body"] = [original["body"][0]]
+    def test_authored_literal_characters_are_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "artifact.yaml"
-            path.write_text(
-                yaml.safe_dump(original, sort_keys=False), encoding="utf-8"
-            )
-            composition = DocumentComposition.load(path, self.project)
+            root = Path(directory).resolve()
+            source = root / "root.tex"
+            text = "Literal text, % a comment\n" + r"\texttt{value} and \% percent."
+            source.write_text(text)
+            projection = project_source(source, None, root, {}, shared_result=_memo(root))
+            self.assertEqual(projection.raw, text)
 
-        self.assertEqual(len(composition.blocks), 1)
-
-    def test_composition_rejects_duplicate_explicit_placement(self) -> None:
-        source = self.repository / "artifacts/isa-reference/artifact.yaml"
-        document = yaml.safe_load(source.read_text(encoding="utf-8"))
-        placed = document["body"][0]
-        document["body"] = [placed, placed]
+    def test_ignored_tex_regions_do_not_create_source_occurrences(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "artifact.yaml"
-            path.write_text(
-                yaml.safe_dump(document, sort_keys=False), encoding="utf-8"
-            )
-            with self.assertRaises(ValueError):
-                DocumentComposition.load(path, self.project)
+            root = Path(directory).resolve()
+            source = root / "root.tex"
+            text = "% (:ref:base.topics.missing:)\n" + r"\(:term:base.terms.missing:) \\input{missing.tex}"
+            source.write_text(text)
+            projection = project_source(source, None, root, {}, shared_result=_memo(root))
+            self.assertEqual(projection.parts, ())
 
-    def test_tex_validation_requires_one_document_environment(self) -> None:
-        tex = r"\begin{document}\end{document}"
-        report = TexValidator().validate(tex + r"\begin{document}")
+    def test_unknown_term_is_rejected_during_source_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "root.tex"
+            source.write_text("(:term:base.terms.unknown:)")
+            with self.assertRaises(ValueError) as caught:
+                project_source(source, None, root, _semantic_catalogs(), shared_result=_memo(root))
+            self.assertIn(f"{source}, offset 0", str(caught.exception))
+            self.assertIsInstance(caught.exception.__cause__, UnknownReferenceError)
 
+    def test_reference_preserves_canonical_entity_and_original_span(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            entity = _topic(root, "selected")
+            source = root / "root.tex"
+            text = "See (:ref:base.topics.selected:)."
+            source.write_text(text)
+            catalogs = _semantic_catalogs(entity)
+            projection = project_source(source, None, root, catalogs, shared_result=_memo(root))
+            occurrence, = projection.parts
+            self.assertIs(occurrence.reference.entity, entity)
+            self.assertEqual(text[occurrence.span.start:occurrence.span.end], "(:ref:base.topics.selected:)")
+            targets = PublicTargetCatalog.create(catalogs["isa"].entities, ((entity.reference,),), (entity.reference,))
+            self.assertIs(targets.resolve(entity.reference), entity)
+
+    def test_unknown_entity_is_rejected_during_source_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "root.tex"
+            source.write_text("(:ref:base.topics.unknown:)")
+            with self.assertRaises(ValueError) as caught:
+                project_source(source, None, root, _semantic_catalogs(), shared_result=_memo(root))
+            self.assertIn(f"{source}, offset 0", str(caught.exception))
+            self.assertIsInstance(caught.exception.__cause__, UnknownReferenceError)
+
+
+class DocumentSelectionTest(unittest.TestCase):
+    def test_explicit_topic_order_preserves_canonical_members(self):
+        root = Path("/synthetic")
+        first, second = _topic(root, "first"), _topic(root, "second")
+        isa = SimpleNamespace(model=SimpleNamespace(document_topics=ReferenceIndex({value.reference: value for value in (first, second)})), entities=create_entity_catalog(((first, "First"), (second, "Second"))))
+        composition = load_composition([{"topic": "base.topics.second"}, {"topic": "base.topics.first"}], isa=isa, sources={})
+        self.assertIs(composition.blocks[0], second)
+        self.assertIs(composition.blocks[1], first)
+        with tempfile.TemporaryDirectory() as directory:
+            source_root = Path(directory).resolve()
+            path = source_root / "empty.tex"
+            path.write_text("Authored text.")
+            sources = {value.reference: project_source(path, value, source_root, {}, shared_result=_memo(source_root)) for value in (first, second)}
+            projection = project_document(composition, isa, sources)
+            self.assertIs(projection.blocks[0].topic, second)
+            self.assertIs(projection.blocks[1].topic, first)
+
+    def test_internal_catalog_growth_does_not_change_explicit_selection(self):
+        root = Path("/synthetic")
+        selected, private = _topic(root, "selected"), _topic(root, "private")
+        results = []
+        for members in ((selected,), (private, selected)):
+            isa = SimpleNamespace(model=SimpleNamespace(document_topics=ReferenceIndex({item.reference: item for item in members})))
+            results.append(load_composition([{"topic": "base.topics.selected"}], isa=isa, sources={}))
+        for result in results:
+            self.assertEqual(result.blocks, (selected,))
+            self.assertIs(result.blocks[0], selected)
+
+    def test_unselected_source_lookup_member_does_not_add_public_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            selected, private = _topic(root, "selected"), _topic(root, "private")
+            selected.document.write_text("Selected prose.")
+            private.document.write_text("(:ref:base.topics.private:)")
+            catalogs = _semantic_catalogs(selected, private)
+            isa = catalogs["isa"]
+            isa.model = SimpleNamespace(document_topics=ReferenceIndex({item.reference: item for item in (selected, private)}))
+            memo = _memo(root)
+            sources = {item.reference: project_source(item.document, item, root, catalogs, shared_result=memo) for item in (selected, private)}
+            composition = load_composition([{"topic": "base.topics.selected"}], isa=isa, sources={})
+            projection = project_document(composition, isa, sources)
+            self.assertEqual(projection.dependencies.edges, ())
+            self.assertFalse(projection.public_targets.contains(private.reference))
+
+    def test_duplicate_explicit_topic_placement_is_rejected(self):
+        value = _topic(Path("/synthetic"), "selected")
+        isa = SimpleNamespace(model=SimpleNamespace(document_topics=ReferenceIndex({value.reference: value})))
+        with self.assertRaises(ValueError):
+            load_composition([{"topic": "base.topics.selected"}] * 2, isa=isa, sources={})
+
+    def test_known_unselected_reference_does_not_acquire_public_target(self):
+        selected, private = (_topic(Path("/synthetic"), name) for name in ("selected", "private"))
+        entities = create_entity_catalog(((selected, "Selected"), (private, "Private")))
+        with self.assertRaises(ValueError):
+            PublicTargetCatalog.create(entities, ((selected.reference,),), (private.reference,))
+
+    def test_dependency_serialization_preserves_endpoint_closure_and_occurrences(self):
+        root = Path("/synthetic")
+        first, second = _topic(root, "first"), _topic(root, "second")
+        entities = create_entity_catalog(((first, "First"), (second, "Second")))
+        graph = DependencyGraph(tuple(DependencyEdge(first.reference, second.reference, "reference", first.document, offset) for offset in (3, 17)))
+        render = import_module("artifacts.isa-reference.dependencies").render_dependency_graph
+        serialized = json.loads(render(graph, {item.reference: (item, entities.presentation(item.reference)) for item in (first, second)}, root))
+        nodes = {node["display"]: node for node in serialized["nodes"]}
+        edge, = serialized["edges"]
+        self.assertEqual((edge["source"], edge["target"]), (nodes["First"]["id"], nodes["Second"]["id"]))
+        self.assertEqual(edge["occurrences"], 2)
+        self.assertEqual([location["offset"] for location in edge["locations"]], [3, 17])
+
+    def test_event_row_preserves_declared_class_and_selector(self):
+        root = Path("/synthetic")
+        event = ArchitecturalEvent(Reference("base", ("events", "fault"), "sample"), root / "event.yaml", root, "sample", "Sample", "Sample event", 0x123456, None, "basic", ())
+        event_class = EventClassDefinition(Reference("base", ("events",), "fault"), root / "class.yaml", root, "fault", _inventory(root, "events", ("sample",)), {"sample": event}, "Fault", 0xAB, EventSelector("fixed", 24))
+        namespace = EventNamespace("base", root, _inventory(root, "classes", ("fault",)), {"fault": event_class})
+        catalog = EventCatalog({"base": namespace}, ReferenceIndex({event_class.reference: event_class}), ReferenceIndex({event.reference: event}))
+        row = project_row_event_reference(catalog, event.reference)
+        self.assertEqual(row.reference, event.reference)
+        self.assertEqual(row.code, 0xAB123456)
+
+    def test_register_selection_preserves_explicit_group_order(self):
+        root = Path("/synthetic")
+        groups = tuple(ExplicitRegisterGroup(Reference("base", ("registers",), name), root / name / "group.yaml", root / name, "base", name, 64, None, None, None, {}, _inventory(root / name, "registers")) for name in ("LEFT", "RIGHT"))
+        namespace = RegisterNamespace("base", root, _inventory(root, "groups", ("LEFT", "RIGHT")), {item.id: item for item in groups})
+        catalog = RegisterCatalog({"base": namespace}, ReferenceIndex({item.reference: item for item in groups}), ReferenceIndex({}), ReferenceIndex({}))
+        selected = select_register_figure("base", ("RIGHT", "LEFT"), owner=_topic(root, "registers"), catalog=catalog)
+        self.assertIs(selected.groups[0], groups[1])
+        self.assertIs(selected.groups[1], groups[0])
+
+    def test_register_selection_rejects_foreign_owner(self):
+        with self.assertRaises(ValueError):
+            select_register_figure("OTHER", ("REGS",), owner=_topic(Path("/synthetic"), "registers"), catalog=RegisterCatalog({}, ReferenceIndex({}), ReferenceIndex({}), ReferenceIndex({})))
+
+    def test_record_selection_preserves_canonical_record(self):
+        root = Path("/synthetic")
+        record = MemoryRecord(Reference("base", ("records",), "STATE"), root / "record.yaml", root, "base", "STATE", "State", 8, None, (MemoryRecordComponent("word", "Word", 1, ElementByteSize(fixed=8), None, None),))
+        namespace = MemoryRecordNamespace("base", root, _inventory(root, "records", (record.id,)), {record.id: record})
+        catalog = MemoryRecordCatalog({"base": namespace}, ReferenceIndex({record.reference: record}))
+        projection = select_memory_record(record.reference, owner=_topic(root, "records"), catalog=catalog)
+        self.assertIs(projection.record, record)
+
+    def test_record_selection_rejects_foreign_owner(self):
+        root = Path("/synthetic")
+        record = MemoryRecord(Reference("OTHER", ("records",), "STATE"), root / "record.yaml", root, "OTHER", "STATE", "State", 8, None, ())
+        namespace = MemoryRecordNamespace("OTHER", root, _inventory(root, "records", (record.id,), "OTHER"), {record.id: record})
+        catalog = MemoryRecordCatalog({"OTHER": namespace}, ReferenceIndex({record.reference: record}))
+        with self.assertRaises(ValueError):
+            select_memory_record(record.reference, owner=_topic(root, "records"), catalog=catalog)
+
+
+class DocumentPublicationTest(unittest.TestCase):
+    def test_document_environment_multiplicity_is_rejected(self):
+        report = validate_tex(r"\begin{document}\end{document}\begin{document}")
         self.assertFalse(report.passed)
-        self.assertEqual(
-            report.issues,
-            (
-                TexValidationIssue(
-                    TexValidationCode.DOCUMENT_ENVIRONMENT_COUNT,
-                    counts=(("begin", 2), ("end", 1)),
-                ),
-            ),
-        )
+        self.assertEqual(report.issues, (TexValidationIssue(TexValidationCode.DOCUMENT_ENVIRONMENT_COUNT, counts=(("begin", 2), ("end", 1))),))
 
-    def test_tex_validation_rejects_reference_without_public_target(self) -> None:
-        tex = r"\begin{document}\hyperref[entity:internal-only]{internal}\end{document}"
-        report = TexValidator().validate(tex)
-
+    def test_missing_hyperref_target_is_rejected(self):
+        report = validate_tex(r"\begin{document}\hyperref[entity:missing]{link}\end{document}")
         self.assertFalse(report.passed)
-        self.assertEqual(
-            report.issues,
-            (
-                TexValidationIssue(
-                    TexValidationCode.UNRESOLVED_PUBLIC_TARGETS,
-                    values=("entity:internal-only",),
-                ),
-            ),
-        )
+        self.assertEqual(report.issues, (TexValidationIssue(TexValidationCode.UNRESOLVED_PUBLIC_TARGETS, values=("entity:missing",)),))
 
-    def test_document_builder_publishes_one_declared_owner_without_compiling(self) -> None:
+    def test_generation_does_not_publish_files(self):
         with tempfile.TemporaryDirectory() as directory:
-            output = (Path(directory) / "output").resolve()
+            definition, context = _document_fixture(Path(directory).resolve())
+            result = context.generate(definition.id)
+            self.assertEqual(tuple(item.relative_path for item in result.artifacts), (definition.outputs["document"],))
+            self.assertFalse(context.output_root.exists())
 
-            result = DocumentBuilder(generator=self.generator).build(
-                self.workspace, output, compile_pdf=False
-            )
-
+    def test_disabled_compilation_publishes_declared_source_and_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            definition, context = _document_fixture(Path(directory).resolve())
+            with patch("artifacts._shared.documents.compile_latex") as compiler:
+                result = build_document(definition, context, compile_pdf=False)
+            compiler.assert_not_called()
             self.assertTrue(result.report.passed)
-            self.assertEqual(
-                result.tex,
-                output / self.generator.definition.outputs["document"],
-            )
             self.assertIsNone(result.pdf)
-            ownership = output / ".artifact-ownership"
-            manifest = json.loads(
-                (ownership / f"{self.generator.artifact_id}.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            self.assertEqual(
-                set(manifest["paths"]),
-                self._existing_declared_outputs(output),
-            )
+            self.assertEqual(result.tex, context.output_root / definition.outputs["document"])
+            self._assert_source_ownership(definition, context.output_root)
 
-    def test_derived_output_root_is_visible_to_registry_collision_validation(self) -> None:
-        first = ArtifactDefinition(
-            "first",
-            Path("first/artifact.yaml"),
-            {
-                "outputs": {"source": "tex/source.tex"},
-                "derived-outputs": {"document": "pdf/manual.pdf"},
-            },
-        )
-        second = ArtifactDefinition(
-            "second",
-            Path("second/artifact.yaml"),
-            {"outputs": {"document": "pdf/manual.pdf"}},
-        )
+    def test_primary_and_derived_output_ownership_collision_is_rejected(self):
+        first = ArtifactDefinition("first", Path("first/artifact.yaml"), {"outputs": {"source": "source.tex"}, "derived-outputs": {"document": "compiled/manual.pdf"}})
+        second = ArtifactDefinition("second", Path("second/artifact.yaml"), {"outputs": {"document": "compiled/manual.pdf"}})
+        with self.assertRaisesRegex(ValueError, "overlaps"):
+            ArtifactGeneratorRegistry({"first": first, "second": second}, {})
 
-        with self.assertRaises(ValueError):
-            ArtifactGeneratorRegistry(
-                (_DeclaredGenerator(first), _DeclaredGenerator(second))
-            )
-
-    def test_document_compile_failure_leaves_no_stale_compiled_outputs(self) -> None:
+    def test_compile_failure_removes_prior_owned_compiled_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
-            output = (Path(directory) / "output").resolve()
-            self._seed_compiled_outputs(output)
+            definition, context = _document_fixture(Path(directory).resolve())
+            self._seed_compiled_outputs(definition, context.output_root)
+            failure = RuntimeError("synthetic compiler failure")
+            with patch("artifacts._shared.documents.compile_latex", side_effect=failure):
+                with self.assertRaises(RuntimeError) as caught:
+                    build_document(definition, context, compile_pdf=True)
+            self.assertIs(caught.exception, failure)
+            self._assert_source_ownership(definition, context.output_root)
+            self._assert_compiled_outputs_absent(definition, context.output_root)
 
-            with self.assertRaises(RuntimeError):
-                DocumentBuilder(
-                    generator=self.generator,
-                    compiler=_FailingCompiler(),
-                ).build(self.workspace, output, compile_pdf=True)
-
-            for path in self.generator.definition.derived_outputs.values():
-                if path.parts[0] == "pdf":
-                    self.assertFalse((output / path).exists())
-            manifest = json.loads(
-                (
-                    output
-                    / ".artifact-ownership"
-                    / f"{self.generator.artifact_id}.json"
-                ).read_text(encoding="utf-8")
-            )
-            self.assertEqual(
-                set(manifest["paths"]),
-                self._existing_declared_outputs(output),
-            )
-
-    def test_document_validation_failure_leaves_no_stale_compiled_outputs(self) -> None:
+    def test_validation_failure_removes_prior_compiled_outputs_without_compiling(self):
         with tempfile.TemporaryDirectory() as directory:
-            output = (Path(directory) / "output").resolve()
-            self._seed_compiled_outputs(output)
-
-            result = DocumentBuilder(
-                generator=self.generator,
-                validator=_RejectingValidator(),
-            ).build(self.workspace, output, compile_pdf=True)
-
-            self.assertFalse(result.report.passed)
+            definition, context = _document_fixture(Path(directory).resolve())
+            self._seed_compiled_outputs(definition, context.output_root)
+            report = TexValidationReport(False, (TexValidationIssue(TexValidationCode.UNRESOLVED_PLACEHOLDERS),), {}, {})
+            with patch("artifacts._shared.documents.validate_tex", return_value=report), patch("artifacts._shared.documents.compile_latex") as compiler:
+                result = build_document(definition, context, compile_pdf=True)
+            compiler.assert_not_called()
+            self.assertIs(result.report, report)
             self.assertIsNone(result.pdf)
-            for path in self.generator.definition.derived_outputs.values():
-                if path.parts[0] == "pdf":
-                    self.assertFalse((output / path).exists())
+            self._assert_source_ownership(definition, context.output_root)
+            self._assert_compiled_outputs_absent(definition, context.output_root)
 
-    def _seed_compiled_outputs(self, output: Path) -> None:
-        derived = self.generator.definition.derived_outputs
-        ArtifactWriter().write(
-            GeneratedArtifactSet(
-                (
-                    GeneratedArtifact(derived["compiled-document"], b"old pdf"),
-                    GeneratedArtifact(derived["compile-log"], b"old log"),
-                    GeneratedArtifact(derived["pdf-validation"], "{}\n"),
-                ),
-                artifact_id=self.generator.artifact_id,
-            ),
-            output,
-        )
+    def _seed_compiled_outputs(self, definition, output):
+        write_artifacts(GeneratedArtifactSet(tuple(GeneratedArtifact(definition.derived_outputs[role], b"prior owned result") for role in ("compiled-document", "compile-log", "pdf-validation")), definition.id), output)
 
-    def _existing_declared_outputs(self, output: Path) -> set[str]:
-        return {
-            path.as_posix()
-            for path in self.generator.definition.output_roots
-            if (output / path).is_file()
-        }
+    def _assert_source_ownership(self, definition, output):
+        manifest = json.loads((output / ".artifact-ownership" / f"{definition.id}.json").read_text())
+        expected = {definition.outputs["document"].as_posix(), definition.derived_outputs["tex-validation"].as_posix()}
+        self.assertEqual(set(manifest["paths"]), expected)
+        for relative in expected:
+            self.assertTrue((output / relative).is_file())
 
-    def test_fragment_pipeline_accepts_independent_providers(self) -> None:
-        pipeline = DocumentFragmentPipeline((_SampleFragmentProvider(),))
-
-        self.assertEqual(
-            pipeline.expand(
-                "instructions: @sample@", self.project, self.public_targets
-            ),
-            f"instructions: {len(self.project.select())}",
-        )
-
-    def test_ea_diagram_projection_is_explicit_and_owner_local(self) -> None:
-        topic, reference = next(
-            (topic, Reference.parse(match.group(1)))
-            for topic in self.project.model.document_topics.values()
-            for match in re.finditer(
-                r"(?m)^\(:ea-diagram:([A-Za-z0-9_.-]+):\)$",
-                topic.document.read_text(encoding="utf-8"),
-            )
-        )
-        context = DocumentFragmentContext(
-            self.project, self.public_targets, topic.document
-        )
-        projection = EaDiagramFragmentRenderer.project(
-            context, _reference_text(reference)
-        )
-
-        self.assertEqual(projection.diagram.reference, reference)
-        self.assertEqual(projection.diagram.owner, topic.owner)
-
-        foreign = next(
-            mode.reference
-            for mode in self.project.catalog.ea_modes.values()
-            if mode.reference.owner != topic.owner
-        )
-        with self.assertRaises(ValueError):
-            EaDiagramFragmentRenderer.project(context, _reference_text(foreign))
-
-    def test_register_figure_projection_is_explicit_and_owner_local(self) -> None:
-        topic, owner, groups = next(
-            (topic, match.group(1), tuple(match.group(2).split(",")))
-            for topic in self.project.model.document_topics.values()
-            for match in re.finditer(
-                r"(?m)^\(:register-figure:"
-                r"(base|[A-Z][A-Z0-9_]*):"
-                r"([A-Z][A-Z0-9_]*(?:,[A-Z][A-Z0-9_]*)*):\)$",
-                topic.document.read_text(encoding="utf-8"),
-            )
-        )
-        context = DocumentFragmentContext(
-            self.project, self.public_targets, topic.document
-        )
-        projection = RegisterModelFigureRenderer.project(
-            context, owner, groups
-        )
-
-        self.assertEqual(projection.namespace.owner, topic.owner)
-        self.assertEqual(
-            tuple(group.id for group in projection.groups),
-            groups,
-        )
-
-        foreign = next(
-            namespace.owner
-            for namespace in self.project.registers.namespaces.values()
-            if namespace.owner != topic.owner
-        )
-        with self.assertRaises(ValueError):
-            RegisterModelFigureRenderer.project(
-                context,
-                foreign,
-                tuple(self.project.registers.namespace(foreign).groups)[:1],
-            )
-
-    def test_memory_record_projection_is_explicit_and_owner_local(self) -> None:
-        topic, reference = next(
-            (topic, Reference.parse(match.group(1)))
-            for topic in self.project.model.document_topics.values()
-            for match in re.finditer(
-                r"(?m)^\(:memory-record:"
-                r"((?:base|[A-Z][A-Z0-9_]*)\.records\.[A-Z][A-Z0-9_]*):\)$",
-                topic.document.read_text(encoding="utf-8"),
-            )
-        )
-        context = DocumentFragmentContext(
-            self.project, self.public_targets, topic.document
-        )
-        projection = MemoryRecordFragmentRenderer.project(
-            context, _reference_text(reference)
-        )
-
-        self.assertEqual(projection.record.reference, reference)
-        self.assertEqual(projection.record.owner, topic.owner)
-
-        foreign = next(
-            record.reference
-            for record in self.project.memory_records.references.values()
-            if record.owner != topic.owner
-        )
-        with self.assertRaises(ValueError):
-            MemoryRecordFragmentRenderer.project(
-                context, _reference_text(foreign)
-            )
-
-    def test_fragment_pipeline_rejects_duplicate_placeholder_owners(self) -> None:
-        with self.assertRaises(ValueError):
-            DocumentFragmentPipeline(
-                (_SampleFragmentProvider(), _SampleFragmentProvider())
-            )
+    def _assert_compiled_outputs_absent(self, definition, output):
+        for role in ("compiled-document", "compile-log", "pdf-validation"):
+            self.assertFalse((output / definition.derived_outputs[role]).exists())
 
 
 if __name__ == "__main__":

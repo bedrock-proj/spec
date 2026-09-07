@@ -1,3 +1,5 @@
+
+from engine.workspace import create_workspace
 import io
 import json
 import unittest
@@ -6,9 +8,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from engine.__main__ import main
-from engine.encoding_space import EncodingSpaceAnalyzer
-from engine.encoding_architecture import operator_space
-from engine.project import IsaProject
+from engine.isa.encoding import resolve_encoding_form
+from engine.isa.encoding_space import entries_encoding_space
+from engine.isa.encoding_architecture import operator_space
+from engine.isa.project import load_isa
 from engine.workspace import SpecWorkspace
 
 
@@ -16,8 +19,24 @@ class EngineCliTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.isa_root = Path(__file__).parents[1] / "isa"
-        cls.project = IsaProject.load(cls.isa_root)
-        cls.workspace = SpecWorkspace.create(
+        cls.project = load_isa(cls.isa_root)
+        cls.forms = tuple(
+            (
+                bundle.reference,
+                bundle.encodings.source,
+                resolve_encoding_form(
+                    bundle.instruction,
+                    form,
+                    field_types=cls.project.types.field_types,
+                    payload_types=cls.project.types.payload_types,
+                    ea_modes=cls.project.catalog.ea_modes,
+                    registers=cls.project.registers,
+                ),
+            )
+            for bundle in cls.project.catalog.select()
+            for form in bundle.encodings.forms
+        )
+        cls.workspace = create_workspace(
             cls.isa_root.parent,
             {"isa": cls.project},
         )
@@ -25,7 +44,7 @@ class EngineCliTest(unittest.TestCase):
     def test_json_success_is_empty_array(self) -> None:
         output = io.StringIO()
         errors = io.StringIO()
-        selected = self.project.select()[0]
+        selected = self.project.catalog.select()[0]
         with redirect_stdout(output), redirect_stderr(errors):
             result = main(
                 [
@@ -46,7 +65,7 @@ class EngineCliTest(unittest.TestCase):
         output = io.StringIO()
         errors = io.StringIO()
         with (
-            patch.object(SpecWorkspace, "load", return_value=self.workspace),
+            patch("engine.__main__.load_workspace", return_value=self.workspace),
             redirect_stdout(output),
             redirect_stderr(errors),
         ):
@@ -75,7 +94,7 @@ class EngineCliTest(unittest.TestCase):
         output = io.StringIO()
         errors = io.StringIO()
         with (
-            patch.object(SpecWorkspace, "load", return_value=self.workspace),
+            patch("engine.__main__.load_workspace", return_value=self.workspace),
             redirect_stdout(output),
             redirect_stderr(errors),
         ):
@@ -118,9 +137,7 @@ class EngineCliTest(unittest.TestCase):
         self.assertEqual([item["severity"] for item in diagnostics], ["error"])
 
     def test_encoding_space_entries_uses_class_name_and_operator_space(self) -> None:
-        selected = EncodingSpaceAnalyzer().entries(
-            self.project, "extralong", space="vector"
-        )[0]
+        selected = entries_encoding_space(self.forms, "extralong", space="vector")[0]
         output = io.StringIO()
         with redirect_stdout(output):
             result = main(
@@ -143,7 +160,10 @@ class EngineCliTest(unittest.TestCase):
         entries = json.loads(output.getvalue())
         self.assertTrue(entries)
         self.assertTrue(
-            all(item["instruction"].endswith(f".{selected.mnemonic}") for item in entries)
+            all(
+                item["instruction"].endswith(f".{selected.mnemonic}")
+                for item in entries
+            )
         )
         self.assertTrue(all("reclaimed" in item for item in entries))
 

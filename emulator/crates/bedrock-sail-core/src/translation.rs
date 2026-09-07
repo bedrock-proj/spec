@@ -48,10 +48,28 @@ pub(crate) enum TranslationError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TranslationResult {
+    pub linear_address: u64,
     pub address: u64,
+    pub leaf_mask: Option<u64>,
     pub access_class: i32,
     pub physical_class: i32,
     pub cache_policy: i64,
+}
+
+impl TranslationResult {
+    pub fn within_mapping(&self, bus: &impl Bus, linear: u64) -> Option<Self> {
+        let mask = self.leaf_mask?;
+        if linear & !mask != self.linear_address & !mask {
+            return None;
+        }
+        let address = (self.address & !mask) | (linear & mask);
+        Some(Self {
+            linear_address: linear,
+            address,
+            physical_class: physical_class(bus.physical_memory_class(address)),
+            ..*self
+        })
+    }
 }
 
 pub(crate) fn segment_linear(image: u64, effective: u64) -> Result<u64, TranslationFault> {
@@ -88,6 +106,7 @@ pub(crate) fn translate(
     access: TranslationAccess,
     user_domain: bool,
     supervisor: bool,
+    on_walk_start: impl FnOnce(),
 ) -> Result<TranslationResult, TranslationError> {
     if ptcr & 1 == 0 {
         if linear >> IMPLEMENTATION_PABITS != 0 {
@@ -112,88 +131,95 @@ pub(crate) fn translate(
             format!("non-canonical address 0x{linear:016x}"),
         ));
     }
-    let mut table = root;
-    let mut readable = true;
-    let mut writable = true;
-    let mut executable = true;
-    let mut user = true;
+    on_walk_start();
+    'walk: loop {
+        let mut table = root;
+        let mut readable = true;
+        let mut writable = true;
+        let mut executable = true;
+        let mut user = true;
 
-    for (index, shift) in shifts.iter().copied().enumerate() {
-        let level = (shifts.len() - index) as u8;
-        let index_mask = if level == 1 { 0x1ff } else { 0x7ff };
-        let entry_address = table
-            .checked_add(((linear >> shift) & index_mask) * 8)
-            .filter(|address| address & !PHYSICAL_MASK == 0)
-            .ok_or_else(|| page_fault(2, "page-table entry address exceeds PABITS"))?;
-        let mut entry = bus.read_u64(entry_address).map_err(TranslationError::Bus)?;
-        if entry & PTE_PRESENT == 0 {
-            return Err(page_fault(0, format!("level-{level} PTE is not present")));
-        }
-        let leaf = entry & PTE_TABLE == 0;
-        let valid = if leaf {
-            valid_leaf_entry(entry, level)
-        } else {
-            valid_table_entry(entry, level)
-        };
-        if !valid {
-            return Err(page_fault(2, format!("invalid level-{level} PTE")));
-        }
-
-        let permissions = if leaf {
-            leaf_permissions(entry)
-        } else {
-            table_permissions(entry)
-        };
-        readable &= permissions.0;
-        writable &= permissions.1;
-        executable &= permissions.2;
-        user &= entry & PTE_USER != 0;
-        let requires_user = user_domain || !supervisor;
-        if (requires_user && !user) || (!requires_user && leaf && user) {
-            return Err(page_fault(1, "page privilege violation"));
-        }
-        if access == TranslationAccess::Write && !writable {
-            return Err(page_fault(1, "write to read-only page"));
-        }
-        if access == TranslationAccess::Execute && !executable {
-            return Err(page_fault(1, "execution from non-executable page"));
-        }
-        if access == TranslationAccess::Read && !readable {
-            return Err(page_fault(1, "read from non-readable page"));
-        }
-
-        let mut desired = entry | PTE_ACCESSED;
-        if leaf && access == TranslationAccess::Write {
-            desired |= PTE_DIRTY;
-        }
-        if desired != entry {
-            match bus
-                .compare_exchange_u64(entry_address, entry, desired)
-                .map_err(TranslationError::Bus)?
-            {
-                Ok(_) => entry = desired,
-                Err(_) => return translate(bus, linear, ptcr, access, user_domain, supervisor),
+        for (index, shift) in shifts.iter().copied().enumerate() {
+            let level = (shifts.len() - index) as u8;
+            let index_mask = if level == 1 { 0x1ff } else { 0x7ff };
+            let entry_address = table
+                .checked_add(((linear >> shift) & index_mask) * 8)
+                .filter(|address| address & !PHYSICAL_MASK == 0)
+                .ok_or_else(|| page_fault(2, "page-table entry address exceeds PABITS"))?;
+            let mut entry = bus.read_u64(entry_address).map_err(TranslationError::Bus)?;
+            if entry & PTE_PRESENT == 0 {
+                return Err(page_fault(0, format!("level-{level} PTE is not present")));
             }
-        }
+            let leaf = entry & PTE_TABLE == 0;
+            let valid = if leaf {
+                valid_leaf_entry(entry, level)
+            } else {
+                valid_table_entry(entry, level)
+            };
+            if !valid {
+                return Err(page_fault(2, format!("invalid level-{level} PTE")));
+            }
 
-        if leaf {
-            let address = (entry & PTE_LEAF_PFN_MASK) | (linear & leaf_offset_mask(level));
-            return Ok(TranslationResult {
-                address,
-                access_class: i32::from(((entry & PTE_AM_MASK) >> 2) >= 5),
-                physical_class: physical_class(bus.physical_memory_class(address)),
-                cache_policy: ((entry & PTE_CP_MASK) >> 9) as i64,
-            });
+            let permissions = if leaf {
+                leaf_permissions(entry)
+            } else {
+                table_permissions(entry)
+            };
+            readable &= permissions.0;
+            writable &= permissions.1;
+            executable &= permissions.2;
+            user &= entry & PTE_USER != 0;
+            let requires_user = user_domain || !supervisor;
+            if (requires_user && !user) || (!requires_user && leaf && user) {
+                return Err(page_fault(1, "page privilege violation"));
+            }
+            if access == TranslationAccess::Write && !writable {
+                return Err(page_fault(1, "write to read-only page"));
+            }
+            if access == TranslationAccess::Execute && !executable {
+                return Err(page_fault(1, "execution from non-executable page"));
+            }
+            if access == TranslationAccess::Read && !readable {
+                return Err(page_fault(1, "read from non-readable page"));
+            }
+
+            let mut desired = entry | PTE_ACCESSED;
+            if leaf && access == TranslationAccess::Write {
+                desired |= PTE_DIRTY;
+            }
+            if desired != entry {
+                match bus
+                    .compare_exchange_u64(entry_address, entry, desired)
+                    .map_err(TranslationError::Bus)?
+                {
+                    Ok(_) => entry = desired,
+                    Err(_) => continue 'walk,
+                }
+            }
+
+            if leaf {
+                let address = (entry & PTE_LEAF_PFN_MASK) | (linear & leaf_offset_mask(level));
+                return Ok(TranslationResult {
+                    linear_address: linear,
+                    address,
+                    leaf_mask: Some(leaf_offset_mask(level)),
+                    access_class: i32::from(((entry & PTE_AM_MASK) >> 2) >= 5),
+                    physical_class: physical_class(bus.physical_memory_class(address)),
+                    cache_policy: ((entry & PTE_CP_MASK) >> 9) as i64,
+                });
+            }
+            table = entry & PTE_NEXT_TABLE_MASK;
         }
-        table = entry & PTE_NEXT_TABLE_MASK;
+        return Err(page_fault(2, "page walk did not reach a leaf PTE"));
     }
-    Err(page_fault(2, "page walk did not reach a leaf PTE"))
 }
 
 fn direct_result(bus: &impl Bus, address: u64) -> TranslationResult {
     let class = physical_class(bus.physical_memory_class(address));
     TranslationResult {
+        linear_address: address,
         address,
+        leaf_mask: None,
         access_class: class,
         physical_class: class,
         cache_policy: 0,
@@ -300,6 +326,7 @@ mod tests {
             TranslationAccess::Write,
             false,
             true,
+            || {},
         )
         .unwrap();
 
@@ -322,6 +349,7 @@ mod tests {
             TranslationAccess::Read,
             false,
             true,
+            || {},
         )
         .unwrap_err();
 
@@ -349,6 +377,7 @@ mod tests {
             TranslationAccess::Read,
             false,
             true,
+            || {},
         )
         .unwrap();
 
@@ -361,7 +390,7 @@ mod tests {
         ram.write_u64(0x4000, 0x9000 | TABLE).unwrap();
 
         let error =
-            translate(&mut ram, 0, 0x4005, TranslationAccess::Read, false, true).unwrap_err();
+            translate(&mut ram, 0, 0x4005, TranslationAccess::Read, false, true, || {}).unwrap_err();
 
         assert!(matches!(
             error,
