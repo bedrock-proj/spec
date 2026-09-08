@@ -304,7 +304,7 @@ def render_fragment(selection, labels):
     if isinstance(selection, VectorDiagram):
         return _vector.render_vector_diagram(selection)
     if isinstance(selection, StructuredFieldTarget):
-        return rf"\phantomsection\label{{{target_label(labels, selection.entity.reference)}}}"
+        return rf"\leavevmode\phantomsection\label{{{target_label(labels, selection.entity.reference)}}}"
     if isinstance(selection, EventCodeRow):
         return _tables.render_event_row(selection, labels)
     if isinstance(selection, EventClassesProjection):
